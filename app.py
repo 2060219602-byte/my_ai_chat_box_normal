@@ -1533,12 +1533,9 @@ else:
 
         ultimate_user_content = (
             f"{narrative_anchor}"
-            f"💡【即时演出强制令】：请立刻全盘继承前文发生的所有剧情事实、人设与叙事规范，继续向下展现你的即时行动与戏剧反应。"
+            f"💡【即时演出强制令】：请立刻全盘继承前文发生的所有剧情事实。你必须严格按照【三幕温馨流水账执行准则】展开输出，依次打出 1️⃣、2️⃣、3️⃣ 标签，禁止混排或漏掉任何一幕！"
         )
         cleaned_api_payload.append({"role": "user", "content": ultimate_user_content})
-
-        # 6. RP的开头 (强制打入1️⃣前缀，强迫模型顺理成章地往下写)
-        cleaned_api_payload.append({"role": "assistant", "content": "1️⃣"})
 
         with st.expander("🔍 开发者方案A实时审计：点击查看发给大模型的完整 Payload", expanded=False):
             st.json(cleaned_api_payload)

@@ -1626,31 +1626,26 @@ else:
                         break
 
                 # =======================================================
-                # 🛠️ 格式化思维链洗涤与无缝熔铸缝合
+                # 🛠️ 安全版思维链与开场白精准剥离机制（防止中大段误杀）
                 # =======================================================
-                full_story_response = re.sub(r'0️⃣\s*（心理：[\s\S]*?）', '', full_story_response).strip()
-                full_story_response = re.sub(r'0️⃣\s*\(心理：[\s\S]*?\)', '', full_story_response).strip()
-                full_story_response = re.sub(r'^\[.*?\]', '', full_story_response).strip()
-                full_story_response = re.sub(r'^【.*?】', '', full_story_response).strip()
+                # 仅剔除正文最前端因大模型碎嘴附带的 0️⃣（心理）或引导词，绝不采用长程截断
+                full_story_response = re.sub(r'^0️⃣\s*（心理：.*?）', '', full_story_response, flags=re.DOTALL).strip()
+                full_story_response = re.sub(r'^0️⃣\s*\(心理：.*?\)', '', full_story_response, flags=re.DOTALL).strip()
+                
+                # 仅当 [xxx] 或 【xxx】 处于纯粹的字符串开头时，才予以精准剔除
+                full_story_response = re.sub(r'^\[[^\]]*?\]', '', full_story_response).strip()
+                full_story_response = re.sub(r'^【[^】]*?】', '', full_story_response).strip()
 
-                if captured_formatted_thinking:
-                    pass
-
-                full_story_response = re.sub(r'0️⃣\s*（心理：[\s\S]*?）', '', full_story_response).strip()
-                full_story_response = re.sub(r'0️⃣\s*\(心理：[\s\S]*?\)', '', full_story_response).strip()
-                full_story_response = re.sub(r'^\[.*?\]', '', full_story_response).strip()
-                full_story_response = re.sub(r'^【.*?】', '', full_story_response).strip()
-
-               # ====== 净化版单聊落盒与历史存盘逻辑 ======
+                # ====== 安全稳健的单聊落盒与存盘逻辑 ======
                 with response_placeholder.container():
                     st.markdown(novel_text_formatter(full_story_response), unsafe_allow_html=True)
 
                 single_reply_id = f"reply_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
 
-                # 创建不含选项分支的纯正剧本数据入库
+                # 确保完美存盘，不让任何过滤后产生的异常导致数据丢失
                 mock_message_item = {
                     "role": "assistant",
-                    "content": full_story_response,
+                    "content": full_story_response if full_story_response else "（剧本推演顺利完成，请继续下达动作指令）",
                     "timestamp": time.time(),
                     "msg_id": single_reply_id,
                     "options": {}

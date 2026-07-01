@@ -11,8 +11,11 @@ import time
 # ☁️ 定义服务器本地保存数据的隐藏 JSON 文件路径
 DATA_FILE = "sandbox_private_db.json"
 api_key = st.secrets["deepseek"]["api_key"] if "deepseek" in st.secrets else ""
-model_name = st.sidebar.text_input("模型名称 (Model)", value="deepseek-v4-pro")
-client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+
+# ✨ 默认模型名称直接对齐为 LongCat-2.0 
+model_name = st.sidebar.text_input("模型名称 (Model)", value="LongCat-2.0")
+# ✨ 修正网关 Base_URL 指向 LongCat 的 OpenAI 兼容模式网关
+client = OpenAI(api_key=api_key, base_url="https://api.longcat.chat/openai")
 
 import streamlit as st
 
@@ -1664,17 +1667,18 @@ else:
                 while loop_count < max_loops:
                     loop_count += 1
 
+                    # ✨ 针对 LongCat-2.0 精调的长文完全体思考调度配置
                     response = client.chat.completions.create(
                         model=model_name,
                         messages=loop_payload,
                         stream=True,
-                        max_tokens=4000,
+                        max_tokens=4000,          # 保持 4000 黄金单次吞吐限制，靠下方的 length 机制无限接力续写
                         timeout=60.0,
-                        # 🌟 联动修改：第一轮思考忽略温度；续写轮次给予 0.7 的黄金 RP 温度
-                        temperature=0.0 if loop_count == 1 else 0.7,
-                        # 官方支持 discrete native 级别：low/medium 自动映射为 high，想省事直接用 high 和 max
-                        reasoning_effort="high" if loop_count == 1 else "high",
-                        extra_body={"thinking": {"type": "enabled" if loop_count == 1 else "disabled"}}
+                        temperature=0.75,         # 给模型提供舒适的角色扮演情感张力，第一轮也保持此温度
+                        reasoning_effort="high",  # 让 LongCat 内部的 Reasoning 专家模块拉满功率运作
+                        extra_body={
+                            "thinking": {"type": "enabled"}  # ✨ 彻底长线开启深度思考模式，不按轮次切断
+                        }
                     )
 
                     finish_reason = None

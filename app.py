@@ -1462,17 +1462,19 @@ else:
 
         st.session_state.regenerate_trigger = False
 
+        # 1. 组装核心规则与设定层 (System Prompt 核心三件套：Jailbreak -> 人设 -> 协议)
         dynamic_system_prompt = f"{jailbreak_prompt}\n\n"
         dynamic_system_prompt += (
             f"【当前扮演的AI角色名字】：{target_girl}\n"
             f"【该角色的基本人设设定 (System Role)】：\n{role_data.get('system_role', '')}\n\n"
-            f"【当前演出的背景剧情设定】：\n{role_data.get('background_story', '')}"
+            f"【当前演出的背景剧情设定】：\n{role_data.get('background_story', '')}\n\n"
         )
+        dynamic_system_prompt += f"【最高优先级执行指令 —— 舞台导演小说吐字规范】：\n{multi_reply_protocol}"
 
-        # 1️⃣ 放入完全静态的 System Prompt
+        # 依次向下压入 Payload
         cleaned_api_payload = [{"role": "system", "content": dynamic_system_prompt}]
 
-        # 2️⃣ 放入早期剧情事实大纲回顾（慢变层，确保前三层命中缓存）
+        # 2. 概述历史对话 (历史深层事实大纲编年史)
         all_summaries = role_data.get("summarized_history", [])
         older_summaries = all_summaries[-53:-3] if len(all_summaries) > 3 else all_summaries[:-3]
 
@@ -1482,25 +1484,20 @@ else:
                 formatted_lines.append(f"🎬 [过往戏剧回顾 · 事实大纲]:\n{line}")
 
             chronicle_content = (
-                    "💡【早期剧情前情回顾 · 历史深层记忆总览】\n"
-                    "以下是更早之前发生的情节事实大纲，已化为你本能的潜意识背景，无需在后续回复中复述它们：\n\n" +
+                    "💡【前情回顾 · 历史深层记忆总览（概述历史对话）】\n"
+                    "以下是更早之前发生的情节事实大纲，已化为你本能的潜意识背景：\n\n" +
                     "\n\n-------------------- \n\n".join(formatted_lines)
             )
             cleaned_api_payload.append({"role": "user", "content": chronicle_content})
-            cleaned_api_payload.append({
-                "role": "assistant",
-                "content": "（垂下眼眸，过往的历史事实在脑海中闪过）……这些历史事实早已沉淀为我的行事本能。我需要更专注于近期的现实。"
-            })
 
-        # 3️⃣ 放入核心个人记忆备忘录
+        # 3. 核心个人记忆备忘录拓展夹层（如果有的话）
         if role_data.get("memory_events"):
             memory_ledger_prompt = "📌【核心个人记忆备忘录】：\n"
             for idx, event in enumerate(role_data["memory_events"]):
                 memory_ledger_prompt += f"{idx + 1}. {event}\n"
             cleaned_api_payload.append({"role": "user", "content": memory_ledger_prompt})
-            cleaned_api_payload.append({"role": "assistant", "content": "（调取灵魂深处的核心羁绊）……这些核心线索我绝不会忘。"})
 
-        # 4️⃣ 放入【最近3轮详细对话回溯】（作为前置连续镜头，属于过去的记忆）
+        # 4. 近期详细历史对话 (回溯最近3轮微观接戏镜头)
         prev_history = role_data["chat_history"][:-1]  # 排除当前这一轮输入
         i = len(prev_history) - 1
         turns_found = []
@@ -1513,39 +1510,35 @@ else:
             i -= 1
 
         if turns_found:
-            latest_detailed_prompt = "🎬【📢 当前舞台近景回溯 · 最近3轮详细对话互动锚点】\n"
-            latest_detailed_prompt += "这是你与玩家在刚刚过去的3轮微观互动细节，请作为剧情承接的基础：\n\n"
+            latest_detailed_prompt = "🎬【📢 当前舞台近景回溯 · 最近3轮详细历史对话互动锚点】\n"
+            latest_detailed_prompt += "这是你与玩家在刚刚过去的3轮微观互动细节，请作为紧接剧情承接的基础：\n\n"
 
             for idx, (u_msg, a_msg) in enumerate(turns_found):
                 clean_ai_content = re.sub(r'\[.*?\][\s\S]*$', '', a_msg["content"]).strip()
                 if "🔒DATA_SPLIT_MARKER" in clean_ai_content:
                     clean_ai_content = clean_ai_content.split("🔒DATA_SPLIT_MARKER")[0].strip()
 
-                latest_detailed_prompt += f"========================= [过往第 {3 - idx} 轮近景接戏镜头] =========================\n"
+                latest_detailed_prompt += f"========================= [过往第 {3 - idx} 轮详细历史记录] =========================\n"
                 latest_detailed_prompt += f"【玩家行动/台词】：\n{u_msg['content']}\n\n"
                 latest_detailed_prompt += f"【你（{target_girl}）剧情回应】：\n{clean_ai_content}\n"
 
             latest_detailed_prompt += "=================================================================================\n"
             cleaned_api_payload.append({"role": "user", "content": latest_detailed_prompt})
-            cleaned_api_payload.append({
-                "role": "assistant",
-                "content": "（将最近几轮发生的连续情节沉淀为前置连续镜头，等待接下来的现状显化）……剧情正在向下推演。最近一轮的对白已经收尾。）"
-            })
 
-        cleaned_api_payload.append({"role": "user", "content": "💡【即时接戏演出令】：请全盘承接并无缝继承前文发生的所有剧情线索，继续向下展现你的即时行动与戏剧反应。"})
-
-        # 6️⃣ 放入【最新行动拼接】玩家最新的输入或推演命令
+        # 5. 我的最新行动 (玩家本轮最新指令拼接)
         if "继续推演" in active_user_text or "重算" in active_user_text:
-            narrative_anchor = f"🎬 【当前大导演剧情演进令 —— 物理时间流逝背景】：\n{active_user_text}\n\n"
+            narrative_anchor = f"🎬 【当前大导演剧情演进令 —— 我的最新行动（自动推演）】：\n{active_user_text}\n\n"
         else:
             narrative_anchor = f"⚔️ 【玩家在这一轮发起的最新即时行动/台词如下】：\n\"\"\"\n{active_user_text}\n\"\"\"\n\n"
 
         ultimate_user_content = (
             f"{narrative_anchor}"
-            f"⚡⚡⚡【最高优先级执行指令 —— 舞台导演小说吐字规范】：\n"
-            f"{multi_reply_protocol}"
+            f"💡【即时演出强制令】：请立刻全盘继承前文发生的所有剧情事实、人设与叙事规范，继续向下展现你的即时行动与戏剧反应。"
         )
         cleaned_api_payload.append({"role": "user", "content": ultimate_user_content})
+
+        # 6. RP的开头 (强制打入1️⃣前缀，强迫模型顺理成章地往下写)
+        cleaned_api_payload.append({"role": "assistant", "content": "1️⃣"})
 
         with st.expander("🔍 开发者方案A实时审计：点击查看发给大模型的完整 Payload", expanded=False):
             st.json(cleaned_api_payload)

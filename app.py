@@ -165,14 +165,28 @@ with col1:
         save_all_history(st.session_state.all_chats)
         st.rerun()
 
-# 渲染历史消息
-for idx, msg in enumerate(messages):
-    av = USER_AVATAR if msg["role"] == "user" else ASSISTANT_AVATAR
-    with st.chat_message(msg["role"], avatar=av):
-        st.write(msg["content"])
-        if msg["role"] == "user":
-            if st.button(f"❌ 删除此条及之后", key=f"del_{idx}"):
-                current_chat["messages"] = messages[:idx]
+# ----------------- ✨ 新功能：只展示最新一条记录，其他折叠 -----------------
+if messages:
+    # 如果历史消息多于1条，则把前面的消息装进折叠盒子里
+    if len(messages) > 1:
+        with st.expander(f"📜 查看历史消息（共 {len(messages)-1} 条）", expanded=False):
+            for idx, msg in enumerate(messages[:-1]):
+                av = USER_AVATAR if msg["role"] == "user" else ASSISTANT_AVATAR
+                with st.chat_message(msg["role"], avatar=av):
+                    st.write(msg["content"])
+                    if msg["role"] == "user":
+                        if st.button(f"❌ 删除此条及之后", key=f"del_{idx}"):
+                            current_chat["messages"] = messages[:idx]
+                            save_all_history(st.session_state.all_chats)
+                            st.rerun()
+    # 最后一条消息（永远展开）
+    last_msg = messages[-1]
+    av = USER_AVATAR if last_msg["role"] == "user" else ASSISTANT_AVATAR
+    with st.chat_message(last_msg["role"], avatar=av):
+        st.write(last_msg["content"])
+        if last_msg["role"] == "user":
+            if st.button(f"❌ 删除此条及之后", key=f"del_{len(messages)-1}"):
+                current_chat["messages"] = messages[:len(messages)-1]
                 save_all_history(st.session_state.all_chats)
                 st.rerun()
 
@@ -234,3 +248,4 @@ if user_input or trigger_regenerate:
 
             messages.append({"role": "assistant", "content": full_response})
             save_all_history(st.session_state.all_chats)   # ✨ 聊完就存进云抽屉
+            st.rerun()   # ✨ 自动刷新，把旧消息收进折叠盒

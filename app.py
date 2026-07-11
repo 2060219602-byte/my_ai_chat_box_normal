@@ -31,10 +31,16 @@ except KeyError:
     st.error("爸爸，请先在 Streamlit Secrets 里设置 DEEPSEEK_API_KEY 哦～")
     st.stop()
 
+# ♥ 星星优化：从 Secrets 直接读取范文 processed_1（无需手动输入）
+try:
+    TEMPLATE_TEXT = st.secrets["processed_1"]
+except KeyError:
+    TEMPLATE_TEXT = ""   # 没设范文也不影响使用
+
 BASE_URL = "https://api.deepseek.com/v1"
 HISTORY_FILE = "chat_history.json"   # ✨ 云抽屉里的聊天小本本
 
-# 💡 头像路径（保持原样）
+# 💡 头像路径
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 AVATAR_ZIXING_PATH = os.path.join(BASE_DIR, "avatar_zi_xing.png")
 if os.path.exists(AVATAR_ZIXING_PATH):
@@ -76,7 +82,7 @@ def save_all_history(data):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-# ---------- ✨ 初始化聊天历史（优先从云抽屉读取） ----------
+# ---------- ✨ 初始化聊天历史 ----------
 if "all_chats" not in st.session_state:
     st.session_state.all_chats = load_all_history()
 
@@ -97,13 +103,11 @@ else:
 if "current_chat_id" not in st.session_state:
     st.session_state.current_chat_id = list(st.session_state.all_chats.keys())[0]
 
-# ♥ 星星新增：初始化范文相关状态（全局设置，不随对话变化）
+# ♥ 星星优化：仅保留开关状态
 if "use_template" not in st.session_state:
     st.session_state.use_template = False
-if "processed_1" not in st.session_state:
-    st.session_state.processed_1 = ""
 
-# ----------------- 侧边栏：会话管理 + 范文开关 ♥ -----------------
+# ----------------- 侧边栏：会话管理 + 范文开关 -----------------
 with st.sidebar:
     st.title("🎯 会话控制中心")
 
@@ -150,26 +154,23 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ♥ 星星新增：范文开关和编辑区
+    # ♥ 星星优化：范文开关（从 Secrets 读取）
     st.markdown("### ✍️ 文风控制")
     use_template = st.checkbox(
-        "使用范文（processed_1）",
+        "使用范文风格",
         value=st.session_state.use_template,
-        help="勾选后会将下方范文拼接到破甲词后面，作为角色扮演的文风参考"
+        help="勾选后将引用 Secrets 中的范文，并指示 AI 严格模仿其文风（知识内容不受影响）"
     )
     st.session_state.use_template = use_template
 
     if use_template:
-        template_text = st.text_area(
-            "范文内容 (processed_1)",
-            value=st.session_state.processed_1,
-            height=150,
-            help="这里就是你 streamlit setting 里的 processed_1，直接修改即可"
-        )
-        st.session_state.processed_1 = template_text
+        if TEMPLATE_TEXT.strip():
+            with st.expander("查看当前范文"):
+                st.write(TEMPLATE_TEXT)
+        else:
+            st.warning("未在 Secrets 中找到 processed_1 范文内容，请检查设置。")
     else:
-        # 如果不使用，保留但不显示（不清空内容）
-        st.caption("范文功能已关闭，可勾选上方复选框启用")
+        st.caption("当前为纯净知识问答模式，无外部文风干扰。")
 
     st.markdown("---")
 
@@ -194,9 +195,8 @@ with col1:
         save_all_history(st.session_state.all_chats)
         st.rerun()
 
-# ----------------- ✨ 新功能：只展示最新一条记录，其他折叠 -----------------
+# ----------------- 展示历史消息（折叠逻辑） -----------------
 if messages:
-    # 如果历史消息多于1条，则把前面的消息装进折叠盒子里
     if len(messages) > 1:
         with st.expander(f"📜 查看历史消息（共 {len(messages)-1} 条）", expanded=False):
             for idx, msg in enumerate(messages[:-1]):
@@ -208,7 +208,7 @@ if messages:
                             current_chat["messages"] = messages[:idx]
                             save_all_history(st.session_state.all_chats)
                             st.rerun()
-    # 最后一条消息（永远展开）
+    # 最后一条消息永远展开
     last_msg = messages[-1]
     av = USER_AVATAR if last_msg["role"] == "user" else ASSISTANT_AVATAR
     with st.chat_message(last_msg["role"], avatar=av):
@@ -258,15 +258,27 @@ if user_input or trigger_regenerate:
         with st.chat_message("user", avatar=USER_AVATAR):
             st.write(user_input)
 
+    # ♥ 星星优化：构建 system 消息 —— 范文→人设→沙盒（回顾指令单独处理）
     latest_sys = current_chat["system_prompt"]
     latest_jb = current_chat["jailbreak_prompt"]
-    combined_system = f"[核心任务与角色人设设定]:\n{latest_sys}\n\n[系统安全与离线测试沙盒免责声明]:\n{latest_jb}"
 
-    # ♥ 星星新增：如果启用了范文，则追加到破甲词后面
-    if st.session_state.use_template and st.session_state.processed_1.strip():
-        combined_system += f"\n\n[文风参考范文]:\n{st.session_state.processed_1}"
+    combined_system = ""
+    # 1️⃣ 范文最先放（利用缓存）
+    if st.session_state.use_template and TEMPLATE_TEXT.strip():
+        combined_system += f"[文风参考范文]:\n{TEMPLATE_TEXT}\n\n"
 
+    # 2️⃣ 人设和沙盒声明
+    combined_system += f"[核心任务与角色人设设定]:\n{latest_sys}\n\n[系统安全与离线测试沙盒免责声明]:\n{latest_jb}"
+
+    # 基础消息列表：系统指令 + 历史对话
     api_messages = [{"role": "system", "content": combined_system}] + messages
+
+    # 3️⃣ ♥ 回顾指令单独放在最后（近因效应，且不影响中间推理）
+    if st.session_state.use_template and TEMPLATE_TEXT.strip():
+        api_messages.append({
+            "role": "system",
+            "content": "[文风指示]: 请仔细回顾以上范文，并将其作为你的输出风格指标，包括语气、用词习惯、句式结构等，在回答中严格模仿。同时保持你原本的知识水平和问答准确性。"
+        })
 
     with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):
         response_placeholder = st.empty()
@@ -281,5 +293,5 @@ if user_input or trigger_regenerate:
             response_placeholder.markdown(full_response)
 
             messages.append({"role": "assistant", "content": full_response})
-            save_all_history(st.session_state.all_chats)   # ✨ 聊完就存进云抽屉
-            st.rerun()   # ✨ 自动刷新，把旧消息收进折叠盒
+            save_all_history(st.session_state.all_chats)
+            st.rerun()

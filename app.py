@@ -97,7 +97,13 @@ else:
 if "current_chat_id" not in st.session_state:
     st.session_state.current_chat_id = list(st.session_state.all_chats.keys())[0]
 
-# ----------------- 侧边栏：会话管理（基本不动，只加上 save_all_history 调用） -----------------
+# ♥ 星星新增：初始化范文相关状态（全局设置，不随对话变化）
+if "use_template" not in st.session_state:
+    st.session_state.use_template = False
+if "processed_1" not in st.session_state:
+    st.session_state.processed_1 = ""
+
+# ----------------- 侧边栏：会话管理 + 范文开关 ♥ -----------------
 with st.sidebar:
     st.title("🎯 会话控制中心")
 
@@ -141,6 +147,29 @@ with st.sidebar:
         current["jailbreak_prompt"] = new_jb
         current["system_prompt"] = new_sys
         save_all_history(st.session_state.all_chats)
+
+    st.markdown("---")
+
+    # ♥ 星星新增：范文开关和编辑区
+    st.markdown("### ✍️ 文风控制")
+    use_template = st.checkbox(
+        "使用范文（processed_1）",
+        value=st.session_state.use_template,
+        help="勾选后会将下方范文拼接到破甲词后面，作为角色扮演的文风参考"
+    )
+    st.session_state.use_template = use_template
+
+    if use_template:
+        template_text = st.text_area(
+            "范文内容 (processed_1)",
+            value=st.session_state.processed_1,
+            height=150,
+            help="这里就是你 streamlit setting 里的 processed_1，直接修改即可"
+        )
+        st.session_state.processed_1 = template_text
+    else:
+        # 如果不使用，保留但不显示（不清空内容）
+        st.caption("范文功能已关闭，可勾选上方复选框启用")
 
     st.markdown("---")
 
@@ -232,6 +261,11 @@ if user_input or trigger_regenerate:
     latest_sys = current_chat["system_prompt"]
     latest_jb = current_chat["jailbreak_prompt"]
     combined_system = f"[核心任务与角色人设设定]:\n{latest_sys}\n\n[系统安全与离线测试沙盒免责声明]:\n{latest_jb}"
+
+    # ♥ 星星新增：如果启用了范文，则追加到破甲词后面
+    if st.session_state.use_template and st.session_state.processed_1.strip():
+        combined_system += f"\n\n[文风参考范文]:\n{st.session_state.processed_1}"
+
     api_messages = [{"role": "system", "content": combined_system}] + messages
 
     with st.chat_message("assistant", avatar=ASSISTANT_AVATAR):

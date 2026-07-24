@@ -42,7 +42,7 @@ except KeyError:
 
 # 匹配 Qwen3.8 Demo 配置
 BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-MODEL = "qwen3.8-max-preview"
+MODEL = "qwen3.7-plus"
 HISTORY_FILE = "chat_history.json"  # ✨ 云抽屉里的聊天小本本
 
 # 💡 头像路径

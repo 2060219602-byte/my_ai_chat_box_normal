@@ -3079,8 +3079,6 @@ else:
         # 根据文风选择，取用对应的写作协议
         if st.session_state.get("selected_style_key") == "processed_1":
             active_protocol = multi_reply_protocol_1
-        elif st.session_state.get("selected_style_key") == "processed_2":
-            active_protocol = multi_reply_protocol_2
         elif st.session_state.get("selected_style_key") == "processed_3":
             active_protocol = multi_reply_protocol_3
         elif st.session_state.get("selected_style_key") == "processed_5":

@@ -1296,20 +1296,11 @@ def load_cloud_data():
                         if "dream_since_index" not in role:
                             role["dream_since_index"] = 0
 
-                        # 🎯 单聊六维词库点名使用记录（旧存档兼容）
-                        if "word_usage_counts" not in role:
-                            role["word_usage_counts"] = {}
+                        # 🎯 单聊六维热词发牌结果存档（旧存档兼容）
                         if "last_word_batch" not in role:
                             role["last_word_batch"] = {}
-                        if "word_miss_counts" not in role:
-                            role["word_miss_counts"] = {}
 
-                        # 旧格式迁移：早期版本计数表直接以维度为顶层键，统一迁到“文风键”下
-                        if role["word_usage_counts"] and not any(
-                                str(k).startswith("processed_") for k in role["word_usage_counts"]):
-                            role["word_usage_counts"] = {
-                                saved_data.get("style_preference", "processed_1"): role["word_usage_counts"]
-                            }
+                        # 旧格式迁移：早期版本直接以维度为顶层键，统一迁到“文风键”下
                         if role["last_word_batch"] and not any(
                                 str(k).startswith("processed_") for k in role["last_word_batch"]):
                             role["last_word_batch"] = {
@@ -1374,9 +1365,7 @@ def clear_current_chat_only():
             # 🚀【新增核心修复】：同时将隐秘肉体知觉面板重置回最纯净的常态，擦除过往剧情累积的数值
             role_ref["character_status"] = f"[{r_name}]\n阴道：干燥紧闭。\n乳头：平软未勃起。\n大腿内侧：皮肤处于常温状态。"
 
-            # 🎯 单聊专属：清空六维词库点名使用记录，让所有词的使用次数归零
-            role_ref["word_usage_counts"] = {}
-            role_ref["word_miss_counts"] = {}
+            # 🎯 单聊专属：清空热词发牌结果
             role_ref["last_word_batch"] = {}
 
     elif curr_sk.startswith("💬 群聊："):
@@ -1509,7 +1498,7 @@ else:
 用一句带有挑衅、撒娇或询问性质的台词结束，目的是让玩家或下一位AI成员必须接话，不能冷场。
 *例：“你、你别一直盯着我看呀……倒是说句话嘛。”*
 
-⚠️ 绝对禁止使用0️⃣1️⃣2️⃣3️⃣等分幕符号，请用自然段落直接写，但内部请暗暗遵循这五步的节奏。保持与「六维官能黄金范本」一致的直白、露骨、高密度的叙事笔触。
+⚠️ 绝对禁止使用0️⃣1️⃣2️⃣3️⃣等分幕符号，请用自然段落直接写，但内部请暗暗遵循这五步的节奏。保持直白、露骨、高密度的叙事笔触。
 """
 
     chat_history_view = synthesize_group_chat_history(g_name, st.session_state.group_members_list)
@@ -1960,36 +1949,17 @@ def get_active_word_banks():
     return {}
 
 
-# ========== 自适应点名词降权：AI 连续不用就自动移出推荐池 ==========
-# 每个词记录“连续被点名但 AI 没用”的次数；满 3 次后自动降权，
-# 只有该维度可用词不足 10 个时，降权词才会按“3 次一档”的低分先放回来。
-# AI 一旦实际用到某个词，它的连续未用次数立刻清零，重新回到推荐池。
-MISS_EXCLUDE_THRESHOLD = 3
-
-
 def pick_word_batch(role_data, n=WORDS_PER_DIMENSION):
-    """按使用次数挑词：优先未用词；AI 连续 3 次不用的词自动降权；用尽后补抽使用次数最少的词"""
+    """发牌式真随机：每轮从当前文风词库的每个维度里完全随机抽取 n 个热词，不参考任何历史使用记录"""
     banks = get_active_word_banks()
     if not banks:
         return {}
-    # 每个文风各自独立计数，切换文风不会串用
-    usage = (role_data.get("word_usage_counts") or {}).get(selected_key) or {}
-    miss = (role_data.get("word_miss_counts") or {}).get(selected_key) or {}
     batch = {}
     for dim in WORD_DIMENSIONS:
         words = banks.get(dim) or []
         if not words:
             continue
-        dim_usage = usage.get(dim) or {}
-        dim_miss = miss.get(dim) or {}
-        low_miss = [w for w in words if dim_miss.get(w, 0) < MISS_EXCLUDE_THRESHOLD]
-        high_miss = [w for w in words if dim_miss.get(w, 0) >= MISS_EXCLUDE_THRESHOLD]
-        # 正常词：未用优先（随机），其次使用次数少；同一档内随机打散
-        low_miss.sort(key=lambda w: (dim_usage.get(w, 0), random.random()))
-        # 降权词：按“连续未用次数/3”的档位从低到高，档位相同随机
-        high_miss.sort(key=lambda w: (dim_miss.get(w, 0) // MISS_EXCLUDE_THRESHOLD,
-                                     dim_usage.get(w, 0), random.random()))
-        batch[dim] = (low_miss + high_miss)[:n]
+        batch[dim] = random.sample(words, min(n, len(words)))
     return batch
 
 
@@ -2492,12 +2462,7 @@ if is_group_chat:
         # 1. 人设最前（角色名字 + 人格设定）
         agent_dynamic_system = f"【你当前需要代入的名字：{curr_agent}】\n"
         agent_dynamic_system += f"【你的人格设定】：\n{agent_db.get('system_role', '')}\n\n"
-        # 2. 文风教学引入 + 六维官能黄金范本
-        agent_dynamic_system += style_learning_intro
-        agent_dynamic_system += refined_style_patch
-        agent_dynamic_system += style_learned_outro
-
-        # 3. 之后按原顺序：世界背景、永久记忆备忘录
+        # 2. 之后按原顺序：世界背景、永久记忆备忘录（已去掉六维官能黄金范本）
         if agent_db.get("background_story"):
             agent_dynamic_system += f"【当前群聊的物理时空背景】：\n{agent_db.get('background_story', '')}\n\n"
         if agent_db.get("memory_events"):
@@ -2569,12 +2534,11 @@ if is_group_chat:
                         speak_order_lines.append(f"第{idx + 1}位：【{name}】")
                 speak_order_text = "\n".join(speak_order_lines)
 
-                # 💎 最终输出要求（发言顺序 + 接戏指令 + 范本回顾）
+                # 💎 最终输出要求（发言顺序 + 接戏指令 + 输出格式）
                 ultimate_group_prompt = (
-                    f"⚡⚡⚡【本轮群聊发言指令】（动态顺序 + 文风回顾 + 输出格式）:\n"
+                    f"⚡⚡⚡【本轮群聊发言指令】（动态顺序 + 输出格式）:\n"
                     f"🎤 本轮发言顺序：\n{speak_order_text}\n\n"
                     f"🎬 现在轮到你（{curr_agent}）发言。请全盘承接前面的群内对话，用第三视角小说叙事，自然展现你的动作、台词与神态。\n\n"
-                    f"🔙 现在，立刻在你的脑海中复现开头的「六维官能黄金范本」的笔触，并将那种露骨、细腻、高密度的风格完全应用于你接下来的回复。\n\n"
                     f"{group_output_template}\n\n"  # ← 🆕 五步法格式模板
                     f"📜 另外，群规和你的身份设定已经在上文给出，请牢记遵守。"
                 )
@@ -2878,23 +2842,6 @@ else:
                                                  full_story_response).strip()
                     full_story_response = re.sub(r'^\[.*?\]', '', full_story_response).strip()
                     full_story_response = re.sub(r'^【.*?】', '', full_story_response).strip()
-
-                # 🎯 单聊专属：核对本轮点名用词的实际使用情况并累计次数；
-                #    用到的词 +1 并清零连续未用次数，没用到的词连续未用次数 +1（满 3 次自动降权）
-                if current_word_batch:
-                    usage_store = role_data.setdefault("word_usage_counts", {})
-                    style_usage = usage_store.setdefault(selected_key, {})
-                    miss_store = role_data.setdefault("word_miss_counts", {})
-                    style_miss = miss_store.setdefault(selected_key, {})
-                    for dim, words in current_word_batch.items():
-                        dim_usage = style_usage.setdefault(dim, {})
-                        dim_miss = style_miss.setdefault(dim, {})
-                        for w in words:
-                            if w in full_story_response:
-                                dim_usage[w] = dim_usage.get(w, 0) + 1
-                                dim_miss[w] = 0
-                            else:
-                                dim_miss[w] = dim_miss.get(w, 0) + 1
 
                 with response_placeholder.container():
                     st.markdown(novel_text_formatter(full_story_response), unsafe_allow_html=True)

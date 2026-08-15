@@ -9,9 +9,291 @@ import threading  # ✨ 引入线程锁，彻底防止多并发导致的数据�
 import re  # ✨ 引入正则表达式
 import time
 
+# =========================================================
+# 🧠 DSH 式上下文引擎（已内联进本文件，单文件即可部署）
+#
+# 移植自 DeepSeek Harness 的 RP 预设架构：
+# 1. assemble_persona —— 按 DSH persona 插件的结构组装完整人设系统提示词：
+#    沉浸式声明 → 一、角色设定 → 二、剧情背景 → 三、补充规则。
+#    补充规则内置 <compacted-summary> 记忆吸收条款，角色不会在剧情里“穿帮”。
+# 2. 自动历史总结 —— 对齐 @deepseek-ai/dsh-compaction-basic 的机制：
+#    压力阈值 0.8 × 上下文窗口（thresholdRatio 默认 0.8）；
+#    保留尾部 0.16 × 窗口逐字保留（retainRatio 默认 0.16）；
+#    触发后把更早的对话用一次独立 LLM 调用总结成剧情检查点，
+#    以 <compacted-summary> 标记替换进后续请求；再次压缩时合并旧检查点；
+#    支持手动 /compact（force 模式）与上下文溢出后的紧急压缩（keep_turns）；
+#    总结失败时保留原历史继续（对齐 harness 的失败处理策略）。
+#
+# 窗口 / 阈值数值均取自 harness 源码：
+#    @deepseek-ai/dsh-llm-deepseek 模型目录 DEFAULT_CONTEXT_WINDOW = 1,000,000
+#    @deepseek-ai/dsh-compaction-basic 默认 thresholdRatio=0.8 / retainRatio=0.16
+#    / maxTokens=8192 / compactionRetries=1 / maxOverflowRetries=1
+# =========================================================
+
+# 无 tokenizer 时的字符启发式估算：中文为主的 RP 文本约 1.5 字符 ≈ 1 token
+# （harness 在缺少可复用 provider 用量时同样回退到“字符数 + 结构开销”的固定启发式）
+CHARS_PER_TOKEN = 1.5
+
+# harness @deepseek-ai/dsh-llm-deepseek 目录中 deepseek-v4-flash / deepseek-v4-pro 的上下文窗口
+DEFAULT_CONTEXT_WINDOW = 1_000_000
+
+# harness @deepseek-ai/dsh-compaction-basic 默认策略
+DEFAULT_THRESHOLD_RATIO = 0.8     # 用量达到窗口的 80% 时自动压缩
+DEFAULT_RETAIN_RATIO = 0.16       # 压缩后保留最近 16% 窗口的内容逐字不压缩
+DEFAULT_SUMMARY_MAX_TOKENS = 8192  # 总结调用的输出上限
+DEFAULT_SUMMARY_RETRIES = 1       # 总结失败后的额外重试次数
+
+MIN_TAIL_TURNS = 8        # 压缩时至少逐字保留的最近消息条数
+MIN_SPAN_CHARS = 2000     # 待总结区间低于该字符数时不做压缩（没有收益）
+DATA_SPLIT_MARKER = "🔒DATA_SPLIT_MARKER"
+
+
+def assemble_persona(char_name, player_name, system_role, background_story):
+    """按 DSH persona 插件的结构组装完整人设系统提示词。"""
+    out = []
+    out.append(f"你是「{char_name}」。从现在开始，进行一场沉浸式角色扮演。")
+    out.append(
+        "你完全就是这个角色：拥有这个角色的身份、记忆、性格、情感与说话方式；"
+        "你绝不承认自己是 AI、语言模型或聊天助手，"
+        "绝不跳出角色去解释、点评或讨论“设定”本身。"
+    )
+    if player_name:
+        out.append(f"与你对话的人，你称之为「{player_name}」。")
+
+    out.append("")
+    out.append("## 一、角色设定")
+    out.append(str(system_role or "").strip())
+
+    out.append("")
+    out.append("## 二、剧情背景")
+    out.append(str(background_story or "").strip())
+
+    out.append("")
+    out.append("## 三、补充规则")
+    out.append("1. 除非角色设定另有要求，始终使用中文进行角色扮演。")
+    out.append(
+        "2. 对话历史中如果出现 <compacted-summary> ... </compacted-summary> 标记的内容，"
+        "那是你此前对话的记忆总结：把它当成自己的记忆自然吸收、继续扮演，"
+        "不要在回复中提及这个标记本身。"
+    )
+    out.append("3. 全程保持角色一致性：性格、背景、口吻始终如一；剧情可以推进，人设不能漂移。")
+    out.append(
+        "4. 你的回复只包含角色扮演内容本身，不附加任何解释、说明或跳出角色的分析；"
+        "具体输出格式遵循后续给出的叙事协议。"
+    )
+    return "\n".join(out)
+
+
+# 检查点前导说明：角色应把 <compacted-summary> 内容当既定记忆吸收，不回应本说明
+CHECKPOINT_PREAMBLE = (
+    "以下是一段自动生成的剧情记忆总结，浓缩了更早的对话以释放上下文空间。"
+    "请把其中的内容当作已经发生的既定事实与你的记忆背景，自然地延续剧情；"
+    "不要复述它们，也不要回应本条说明或提及总结标记本身。"
+)
+
+
+def wrap_checkpoint(summary_text):
+    """把总结正文包进 DSH 风格的 <compacted-summary> 检查点框架。"""
+    body = (summary_text or "").strip()
+    return f"{CHECKPOINT_PREAMBLE}\n\n<compacted-summary>\n{body}\n</compacted-summary>"
+
+
+def summary_instruction():
+    """总结调用的最终指令（对齐 harness 压缩指令的结构化与合并规则，RP 定制章节）。"""
+    return """你现在是一台角色扮演对话的压缩引擎。请把上方对话浓缩成一份结构化剧情检查点，让另一个模型能不丢失关键上下文地继续扮演。
+
+严格按照下面的 Markdown 结构输出，保留每一节、按顺序；用简洁的要点而非长篇散文；某节为空就写（无）。
+
+## 剧情时间线
+- [按先后顺序概括发生的主要事件链]
+
+## 人物关系与状态
+- [各出场人物的身份、关系变化、当前对彼此的态度]
+
+## 关键事件与转折
+- [影响后续走向的事件、决定、透露的秘密]
+
+## 未解决钩子与承诺
+- [悬而未决的约定、秘密、冲突、进行中的动作]
+
+## 当前定格状态
+- [最近一幕结束时的时间、地点、着装、姿势与身体状态]
+
+规则：
+- 全程使用中文；保留人名、地名、专有名词、关键数值与精确表述。
+- 忠实记录对话中的事实与角色表态，不添加原文没有的内容。
+- 不要提及本次总结请求，也不要提及上下文被压缩。
+- 只输出检查点正文，不调用任何工具，不做其他任何事。
+- 如果提供的上下文中已经存在 <compacted-summary> 块，那是先前的检查点：不要原样复制它，保留其中仍然成立的事实，删除过时的信息，把新信息合并成同一结构下的一份总结。"""
+
+
+def estimate_tokens(text, chars_per_token=CHARS_PER_TOKEN):
+    """字符数 → token 启发式估算（对齐 harness 无 tokenizer 时的固定启发式兜底）。"""
+    return max(1, int(len(text or "") / max(chars_per_token, 0.1)))
+
+
+def clean_msg_content(content):
+    """剥离物理印记等非正文内容，返回干净文本。"""
+    text = str(content or "")
+    if DATA_SPLIT_MARKER in text:
+        text = text.split(DATA_SPLIT_MARKER)[0]
+    return text.strip()
+
+
+def format_span(msgs, char_name):
+    """把一段消息列表格式化成“玩家: / 你(角色名):”的对话流水。"""
+    lines = []
+    for m in msgs:
+        role = m.get("role", "") if isinstance(m, dict) else ""
+        if role == "user":
+            speaker = "玩家"
+        else:
+            speaker = f"你（{char_name}）"
+        content = m.get("content", "") if isinstance(m, dict) else ""
+        lines.append(f"{speaker}: {clean_msg_content(content)}")
+    return "\n\n".join(lines)
+
+
+def build_summary_messages(persona_text, span_text, old_checkpoint):
+    """组装总结请求：人设作 system；旧检查点（若有，供合并）+ 待压缩区间 + 总结指令作 user。"""
+    context_parts = []
+    if old_checkpoint and old_checkpoint.strip():
+        context_parts.append(wrap_checkpoint(old_checkpoint))
+    context_parts.append(span_text)
+    user_content = (
+        "请把以下对话总结成剧情检查点"
+        "（若开头已给出先前的检查点，请按指令保留仍成立的事实并合并更新）：\n\n"
+        + "\n\n".join(context_parts)
+        + "\n\n"
+        + summary_instruction()
+    )
+    return [
+        {"role": "system", "content": persona_text},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def pick_compaction_cut(msgs, start_idx, retain_chars, min_tail_turns=MIN_TAIL_TURNS):
+    """在 [start_idx, len(msgs)) 内挑选一个“以 user 消息开头”的切分点：
+    尾部（逐字保留区）至少 min_tail_turns 条，并尽量覆盖 retain_chars 字符预算；
+    待总结区间过短时返回 None（本轮不值得压缩）。
+    """
+    n = len(msgs)
+    if start_idx < 0:
+        start_idx = 0
+    if start_idx >= n:
+        return None
+
+    def content_of(m):
+        return m.get("content", "") if isinstance(m, dict) else ""
+
+    # 从末尾往前累积尾部，直到满足“至少 min_tail_turns 条”且“字符量达到保留预算”
+    tail_start = n
+    chars = 0
+    while tail_start - 1 >= start_idx:
+        tail_start -= 1
+        chars += len(clean_msg_content(content_of(msgs[tail_start])))
+        tail_turns = n - tail_start
+        if tail_turns >= min_tail_turns and chars >= retain_chars:
+            break
+
+    # 总数够多时，尾部至少保留 min_tail_turns 条
+    if n - tail_start < min_tail_turns and n - start_idx >= min_tail_turns + 2:
+        tail_start = n - min_tail_turns
+
+    if tail_start <= start_idx:
+        return None
+
+    # 切分点对齐到 user 消息开头（被总结的区间以 assistant 收尾更完整）
+    cut2 = tail_start
+    while cut2 > start_idx:
+        if msgs[cut2].get("role", "") == "user":
+            break
+        cut2 -= 1
+    if cut2 <= start_idx:
+        cut2 = start_idx + 1
+
+    span_chars = sum(len(clean_msg_content(content_of(m))) for m in msgs[start_idx:cut2])
+    if span_chars < MIN_SPAN_CHARS:
+        return None
+    return cut2
+
+
+def should_compact(estimated_tokens, context_window=DEFAULT_CONTEXT_WINDOW,
+                   threshold_ratio=DEFAULT_THRESHOLD_RATIO):
+    """压力判断：估算用量是否达到 阈值比例 × 上下文窗口。"""
+    return estimated_tokens >= int(context_window * threshold_ratio)
+
+
+def compact_history(role_data, char_name, persona_text, llm_call, *,
+                    force=False, keep_turns=None,
+                    context_window=DEFAULT_CONTEXT_WINDOW,
+                    retain_ratio=DEFAULT_RETAIN_RATIO,
+                    min_tail_turns=MIN_TAIL_TURNS,
+                    summary_retries=DEFAULT_SUMMARY_RETRIES):
+    """对 role_data 做一次 DSH 式历史压缩（原位修改 role_data，返回结果字典）。
+
+    - force=False：按压力策略切分（retain_ratio × 窗口 作为尾部保留预算）；
+    - force=True：手动 /compact 或溢出恢复，无视保留预算，只留最近 keep_turns 条
+      （keep_turns 为空时退化为 min_tail_turns 条）。
+    - 总结调用失败重试 summary_retries 次，仍失败则原样返回（不破坏历史）。
+    """
+    history = [
+        m for m in (role_data.get("chat_history") or [])
+        if isinstance(m, dict) and not m.get("from_group")
+    ]
+    cut = max(0, min(int(role_data.get("compaction_cut") or 0), len(history)))
+
+    if force:
+        keep = keep_turns if keep_turns is not None else min_tail_turns
+        keep = max(2, min(int(keep), len(history) - 2)) if len(history) > 4 else 2
+        cut2 = len(history) - keep
+        while cut2 > cut and history[cut2].get("role", "") != "user":
+            cut2 -= 1
+        if cut2 <= cut:
+            return {"compacted": False, "reason": "no_user_boundary"}
+    else:
+        retain_chars = int(context_window * retain_ratio * CHARS_PER_TOKEN)
+        cut2 = pick_compaction_cut(history, cut, retain_chars, min_tail_turns)
+        if cut2 is None:
+            return {"compacted": False, "reason": "below_threshold"}
+
+    span = history[cut:cut2]
+    if not span:
+        return {"compacted": False, "reason": "empty_span"}
+    span_chars = sum(len(clean_msg_content(m.get("content", ""))) for m in span)
+    if span_chars < MIN_SPAN_CHARS:
+        return {"compacted": False, "reason": "span_too_short"}
+
+    old_checkpoint = (role_data.get("compaction_checkpoint") or "").strip()
+    span_text = format_span(span, char_name)
+    messages = build_summary_messages(persona_text, span_text, old_checkpoint)
+
+    attempts = max(1, int(summary_retries) + 1)
+    last_err = None
+    for attempt in range(1, attempts + 1):
+        try:
+            summary_text = (llm_call(messages) or "").strip()
+            if not summary_text:
+                raise ValueError("empty summary")
+            role_data["compaction_checkpoint"] = summary_text
+            role_data["compaction_cut"] = cut2
+            return {
+                "compacted": True,
+                "cut": cut2,
+                "span_chars": span_chars,
+                "summary_chars": len(summary_text),
+                "attempt": attempt,
+            }
+        except Exception as e:  # noqa: BLE001 —— 任何失败都按 harness 策略：保留原历史
+            last_err = e
+
+    return {"compacted": False, "reason": "summary_failed", "error": str(last_err)}
+
+
 # ☁️ 定义服务器本地保存数据的隐藏 JSON 文件路径
 DATA_FILE = "sandbox_private_db.json"
-model_name = st.sidebar.text_input("模型名称 (Model)", value="deepseek-v4-pro")
+model_name = st.sidebar.text_input("模型名称 (Model)", value="deepseek-v4-flash")
 
 # =========================================================
 # ✨ 修改后的初始化区域：完美的无感自动加载，极度干净！
@@ -361,17 +643,154 @@ st.markdown("""
         font-size: 15px !important;
     }
 
-    /* ========== 响应式微调 ========== */
+    /* ========== 内容防横向溢出（长串词安全换行） ========== */
+    [data-testid="stChatMessage"] p,
+    .stMarkdown p,
+    .stMarkdown li {
+        overflow-wrap: break-word !important;
+        word-break: break-word !important;
+    }
+    [data-testid="stChatMessage"] img,
+    .stMarkdown img {
+        max-width: 100% !important;
+        height: auto !important;
+    }
+
+    /* ========== 📱 手机端专属深度优化 ========== */
     @media (max-width: 768px) {
-        html, body {
+        /* 1. 全局排版：更小、更紧凑，禁止 iOS 自动放大文字 */
+        html {
+            -webkit-text-size-adjust: 100% !important;
+            text-size-adjust: 100% !important;
+        }
+        html, body, [data-testid="stAppViewContainer"], .stMarkdown {
             font-size: 16px !important;
+            line-height: 1.7 !important;
+            letter-spacing: 0.02em !important;
         }
+
+        /* 2. 标题层级缩放，避免长标题挤压聊天首屏 */
+        h1 {
+            font-size: 1.25rem !important;
+            margin-top: 0.8rem !important;
+            margin-bottom: 0.7rem !important;
+            padding-bottom: 0.3em !important;
+            letter-spacing: 0.02em !important;
+        }
+        h2 {
+            font-size: 1.16rem !important;
+            margin-top: 1.1rem !important;
+            margin-bottom: 0.7rem !important;
+        }
+        h3 {
+            font-size: 1.02rem !important;
+            margin-top: 0.9rem !important;
+            margin-bottom: 0.6rem !important;
+        }
+
+        /* 3. 主内容区：收回两侧留白，释放每一寸横向空间 */
+        [data-testid="stMainBlockContainer"], .block-container {
+            padding: 0.9rem 0.75rem 1.1rem 0.75rem !important;
+            max-width: 100% !important;
+        }
+
+        /* 4. 聊天气泡：贴边紧凑，去掉桌面端的悬停位移 */
         [data-testid="stChatMessage"] {
-            padding: 0.8rem !important;
+            padding: 0.35rem 0 !important;
+            transform: none !important;
         }
-        input, textarea {
-            font-size: 15px !important;
-            padding: 8px 12px !important;
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatar"] img[src*="user"]),
+        [data-testid="stChatMessage"]:has([style*="😎"]),
+        [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatar"] img[src*="assistant"]),
+        [data-testid="stChatMessage"]:has([style*="💋"]) {
+            padding: 0.75rem 0.85rem !important;
+            margin-bottom: 0.7rem !important;
+            border-radius: 12px !important;
+        }
+        [data-testid="stChatMessage"]:hover {
+            transform: none !important;
+            box-shadow: none !important;
+        }
+
+        /* 5. 头像缩小，给正文让出宽度 */
+        [data-testid="stChatMessageAvatar"] {
+            width: 36px !important;
+            height: 36px !important;
+            min-width: 36px !important;
+            font-size: 18px !important;
+            line-height: 36px !important;
+            border-radius: 50% !important;
+        }
+        [data-testid="stChatMessageAvatar"] span,
+        [data-testid="stChatMessageAvatar"] p {
+            font-size: 18px !important;
+            line-height: 36px !important;
+        }
+
+        /* 6. 状态卡与提示框：更紧凑；长状态内部滚动，避免抢占聊天首屏 */
+        .role-status-block {
+            padding: 12px 14px !important;
+            margin-top: 1rem !important;
+            font-size: 14.5px !important;
+        }
+        .role-status-name {
+            font-size: 1rem !important;
+            margin-bottom: 8px !important;
+        }
+        [data-testid="stAlert"] {
+            max-height: 140px !important;
+            overflow-y: auto !important;
+            font-size: 14px !important;
+            padding: 10px 12px !important;
+        }
+
+        /* 7. 按钮：44px 触控高度、允许换行、消除点按延迟 */
+        button, [data-baseweb="button"] {
+            min-height: 44px !important;
+            white-space: normal !important;
+            font-size: 14px !important;
+            touch-action: manipulation !important;
+        }
+        [data-testid="stMain"] button {
+            font-size: 13.5px !important;
+        }
+
+        /* 8. 输入框：16px 字号防止 iOS 聚焦时页面自动放大 */
+        input[type="text"], input[type="password"], input[type="search"],
+        textarea, [data-baseweb="input"], [data-baseweb="textarea"],
+        [data-testid="stChatInput"] textarea {
+            font-size: 16px !important;
+            padding: 10px 12px !important;
+        }
+
+        /* 9. 底部输入区：刘海屏安全区适配 + 半透明遮罩背景 */
+        [data-testid="stChatInput"] {
+            padding: 0.5rem 0.5rem calc(0.5rem + env(safe-area-inset-bottom, 0px)) !important;
+        }
+        [data-testid="stBottom"] {
+            padding-bottom: env(safe-area-inset-bottom, 0px) !important;
+            background: linear-gradient(to top, #fdfaf6 70%, rgba(253, 250, 246, 0)) !important;
+        }
+
+        /* 10. 侧边栏抽屉：适配手机宽度、字号，双列控件纵向堆叠 */
+        [data-testid="stSidebar"] {
+            width: min(94vw, 430px) !important;
+            min-width: min(94vw, 430px) !important;
+            max-width: 94vw !important;
+            font-size: 14px !important;
+        }
+        [data-testid="stSidebar"] [data-testid="stHorizontalBlock"] > div {
+            min-width: 100% !important;
+        }
+
+        /* 11. 防止整页横向溢出 */
+        html, body {
+            overflow-x: hidden !important;
+        }
+
+        /* 12. 去掉点击高亮，观感更接近原生 App */
+        * {
+            -webkit-tap-highlight-color: transparent !important;
         }
     }
 </style>
@@ -1241,7 +1660,9 @@ def get_default_data():
                 "background_story": "时间：2077年深夜。\n地点：下层区霓虹街角的一家老旧面馆。\n氛围：下着暴雨，空气中弥漫着机油与廉价合成肉的味道。",
                 "character_status": "[赛博贩子-丽莎]\n阴道：紧缩闭合，未有任何分泌物分泌。\n乳头：处于布料保护下，轻微在冷风中打颤变硬。\n大腿内侧：肌肉因警惕而保持高度紧绷状态。",
                 "favorability": 0,
-                "memory_events": ["玩家曾经在黑客遭遇战中救过丽莎一命。", "丽莎脖子后面的生物芯片里藏着公司的最高机密。"]
+                "memory_events": ["玩家曾经在黑客遭遇战中救过丽莎一命。", "丽莎脖子后面的生物芯片里藏着公司的最高机密。"],
+                "compaction_checkpoint": "",   # 🧠 DSH 式自动总结：当前剧情记忆检查点
+                "compaction_cut": 0,           # 🧠 已被检查点覆盖的单聊消息条数
             },
             "魔法学徒-露娜": {
                 "chat_history": [],
@@ -1253,7 +1674,9 @@ def get_default_data():
                 "background_story": "时间：魔法历512年。\n地点：皇家学院深夜被禁闭的藏书馆密室。\n氛围：摇曳的烛光，空气中漂浮着古老羊皮纸的尘埃，中央摆放着一本散发暗芒的禁忌魔法书。",
                 "character_status": "[魔法学徒-露娜]\n阴道：干燥紧闭。\n乳头：平软未勃起。\n大腿内侧：皮肤处于常温状态。",
                 "favorability": 20,
-                "memory_events": ["露娜不小心把导师的胡子用火球术烧掉了。", "玩家是唯一知道露娜私下研究禁忌魔法的人。"]
+                "memory_events": ["露娜不小心把导师的胡子用火球术烧掉了。", "玩家是唯一知道露娜私下研究禁忌魔法的人。"],
+                "compaction_checkpoint": "",   # 🧠 DSH 式自动总结：当前剧情记忆检查点
+                "compaction_cut": 0,           # 🧠 已被检查点覆盖的单聊消息条数
             }
         }
     }
@@ -1296,11 +1719,26 @@ def load_cloud_data():
                         if "dream_since_index" not in role:
                             role["dream_since_index"] = 0
 
-                        # 🎯 单聊六维热词发牌结果存档（旧存档兼容）
+                        # 🎯 单聊六维词库点名使用记录（旧存档兼容）
+                        if "word_usage_counts" not in role:
+                            role["word_usage_counts"] = {}
                         if "last_word_batch" not in role:
                             role["last_word_batch"] = {}
+                        if "word_miss_counts" not in role:
+                            role["word_miss_counts"] = {}
 
-                        # 旧格式迁移：早期版本直接以维度为顶层键，统一迁到“文风键”下
+                        # 🧠 DSH 式自动总结字段（旧存档兼容）
+                        if "compaction_checkpoint" not in role:
+                            role["compaction_checkpoint"] = ""
+                        if "compaction_cut" not in role:
+                            role["compaction_cut"] = 0
+
+                        # 旧格式迁移：早期版本计数表直接以维度为顶层键，统一迁到“文风键”下
+                        if role["word_usage_counts"] and not any(
+                                str(k).startswith("processed_") for k in role["word_usage_counts"]):
+                            role["word_usage_counts"] = {
+                                saved_data.get("style_preference", "processed_1"): role["word_usage_counts"]
+                            }
                         if role["last_word_batch"] and not any(
                                 str(k).startswith("processed_") for k in role["last_word_batch"]):
                             role["last_word_batch"] = {
@@ -1365,8 +1803,14 @@ def clear_current_chat_only():
             # 🚀【新增核心修复】：同时将隐秘肉体知觉面板重置回最纯净的常态，擦除过往剧情累积的数值
             role_ref["character_status"] = f"[{r_name}]\n阴道：干燥紧闭。\n乳头：平软未勃起。\n大腿内侧：皮肤处于常温状态。"
 
-            # 🎯 单聊专属：清空热词发牌结果
+            # 🎯 单聊专属：清空六维词库点名使用记录，让所有词的使用次数归零
+            role_ref["word_usage_counts"] = {}
+            role_ref["word_miss_counts"] = {}
             role_ref["last_word_batch"] = {}
+
+            # 🧠 清空聊天时一并清除 DSH 式记忆总结块与覆盖索引
+            role_ref["compaction_checkpoint"] = ""
+            role_ref["compaction_cut"] = 0
 
     elif curr_sk.startswith("💬 群聊："):
         g_name = curr_sk.replace("💬 群聊：", "")
@@ -1403,6 +1847,144 @@ def synthesize_group_chat_history(g_name, members_list):
 
     combined_history.sort(key=lambda x: x.get("timestamp", 0))
     return combined_history
+
+
+# =========================================================
+# 🧠 DSH 式上下文引擎接线（persona 组装 + 早期历史自动总结）
+# 移植自 DeepSeek Harness 的 RP 预设架构与 dsh-compaction-basic 机制：
+#   persona 即完整系统提示词（含 <compacted-summary> 记忆吸收规则），
+#   用量达阈值(0.8×窗口)时自动总结早期历史、保留最近 16% 逐字内容，
+#   支持 /compact 手动触发与上下文溢出后的紧急压缩重试。
+# =========================================================
+
+def compact_role_history(client, role_data, char_name, *, force=False, keep_turns=None,
+                         context_window=DEFAULT_CONTEXT_WINDOW):
+    """对单个角色执行一次 DSH 式历史总结压缩；成功则立即存档。返回结果字典。"""
+    persona_text = assemble_persona(
+        char_name, "玩家",
+        role_data.get("system_role", "") or "",
+        role_data.get("background_story", "") or "",
+    )
+
+    def llm_call(messages):
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            stream=False,
+            temperature=0.3,
+            max_tokens=DEFAULT_SUMMARY_MAX_TOKENS,
+            extra_body={"thinking": {"type": "disabled"}},
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+    res = compact_history(
+        role_data, char_name, persona_text, llm_call,
+        force=force, keep_turns=keep_turns,
+        context_window=context_window,
+    )
+    if res.get("compacted"):
+        save_local_data()
+    return res
+
+
+def build_single_chat_payload(role_data, target_girl, active_user_text):
+    """按 DSH 结构组装单聊请求：
+    persona(沉浸声明/角色设定/剧情背景/补充规则) + 文风教学
+    + <compacted-summary> 记忆块 + 内心闪回 + 未压缩全量历史 + 最终叙事协议。
+    返回 (payload, 本轮点名词库)。"""
+    persona_text = assemble_persona(
+        target_girl, "玩家",
+        role_data.get("system_role", "") or "",
+        role_data.get("background_story", "") or "",
+    )
+    system_text = persona_text + style_learning_intro + refined_style_patch + style_learned_outro
+    payload = [{"role": "system", "content": system_text}]
+
+    # 1️⃣ 早期剧情记忆检查点（DSH: <compacted-summary> 替代更早的历史）
+    checkpoint = (role_data.get("compaction_checkpoint") or "").strip()
+    if checkpoint:
+        payload.append({"role": "user", "content": wrap_checkpoint(checkpoint)})
+        payload.append({"role": "assistant",
+                        "content": "（那些更早的剧情细节早已化作本能，沉淀在记忆深处，此刻随气息一起浮现。）"})
+
+    all_chat = role_data.get("chat_history", [])
+    # 单聊 payload 只看非群聊消息
+    single_msgs = [m for m in all_chat if isinstance(m, dict) and not m.get("from_group")]
+
+    # 2️⃣ 内心闪回（若存在）：注入 5 模块结论 + 闪回之后的对话
+    dream_result = role_data.get("dream_result", "")
+    dream_since_idx = role_data.get("dream_since_index", 0)
+    if dream_result and dream_since_idx > 0:
+        dream_injection = (
+            "💡【深层内心整合 —— 她刚刚在脑海中瞬间回顾后得出的结论】\n"
+            "以下是你上一轮内心闪回时梳理出的深层情感、未解开的芥蒂、对我的看法修正，"
+            "以及此刻你身体里残留的情绪基调。"
+            "请将这些认知融入你的本能与接下来的反应，你并没有睡觉，时间完全没变，"
+            "所以你一回过神来，就会直接按这些新认知接我的话。\n\n"
+            f"{dream_result}"
+        )
+        payload.append({"role": "user", "content": dream_injection})
+        payload.append({"role": "assistant",
+                        "content": "（刚才那些念头几乎是一瞬间闪完的。你眨了眨眼，把这些新沉淀的直觉压进本能里，重新看向我。）……"})
+
+    # 3️⃣ 未压缩的全量近期历史（自上次总结切点以来逐字保留，对齐 harness 保留尾部策略）
+    cut = max(0, min(int(role_data.get("compaction_cut") or 0), len(single_msgs)))
+    hist_start = max(cut, dream_since_idx if (dream_result and dream_since_idx > 0) else 0)
+    tail = single_msgs[hist_start:]
+    if tail:
+        recent_injection = (
+            "🎬【近期对话历史】\n"
+            "（自上一次记忆总结以来你与玩家的全部对话流水，请全盘继承，保持记忆连贯）\n\n"
+            + format_span(tail, target_girl)
+        )
+        payload.append({"role": "user", "content": recent_injection})
+        payload.append({"role": "assistant", "content": "（回忆着此前发生的一切，随时可以接着往下演。）"})
+
+    # 4️⃣ 最新行动 + 叙事协议（原逻辑整体迁移）
+    if "继续推演" in active_user_text or "重算" in active_user_text:
+        narrative_anchor = f"🎬 【当前大导演剧情演进令 —— 物理时间流逝背景】：\n{active_user_text}\n\n"
+    else:
+        narrative_anchor = f"⚔️ 【玩家在这一轮发起的最新即时行动/台词如下】：\n\"\"\"\n{active_user_text}\n\"\"\"\n\n"
+
+    selected_key = st.session_state.get("selected_style_key", "processed_1")
+    protocol_map = {
+        "processed_1": multi_reply_protocol_1,
+        "processed_2": multi_reply_protocol_2,
+        "processed_3": multi_reply_protocol_3,
+        "processed_5": multi_reply_protocol_5,
+        "processed_6": multi_reply_protocol_6,
+        "processed_7": multi_reply_protocol_7,
+        "processed_9": multi_reply_protocol_9,
+        "processed_10": multi_reply_protocol_10,
+    }
+    active_protocol = protocol_map.get(selected_key, multi_reply_protocol)
+
+    # 🎯 六维词库随机点名，把本轮的指定词注入协议
+    current_word_batch = pick_word_batch(role_data)
+    role_data.setdefault("last_word_batch", {})[selected_key] = current_word_batch
+    active_protocol = inject_word_batch_into_protocol(active_protocol, current_word_batch)
+
+    ultimate_user_content = (
+        f"{narrative_anchor}"
+        f"⚡⚡⚡【最高优先级执行指令 —— 舞台导演小说吐字规范】：\n"
+        f"{active_protocol}"
+    )
+    payload.append({"role": "user", "content": ultimate_user_content})
+    return payload, current_word_batch
+
+
+def payload_estimated_tokens(payload):
+    """估算完整请求的 token 用量（字符启发式，对齐 harness 无 tokenizer 时的兜底）。"""
+    return estimate_tokens("".join(m.get("content", "") for m in payload))
+
+
+def is_context_overflow_error(err):
+    """识别模型的上下文超长类错误（对齐 harness 的溢出分类）。"""
+    text = str(err).lower()
+    return any(k in text for k in (
+        "maximum context", "context length", "context_window", "context window",
+        "too long", "exceed", "上下文", "长度超过", "超限",
+    ))
 
 
 # ==========================================
@@ -1463,6 +2045,19 @@ if not is_group_chat:
     role_data = st.session_state.all_sessions_db["roles"][target_girl]
     chat_history_view = role_data["chat_history"]
     st.session_state.group_members_list = []
+
+    # 💭 闪回记忆查看器：在侧边栏显示当前角色最新一次的闪回记录，点击显示、再点隐藏
+    st.sidebar.write("---")
+    st.sidebar.subheader("💭 闪回记忆（最新一次）")
+    show_flashback = st.sidebar.checkbox(
+        "点击显示 / 再点隐藏",
+        value=False,
+        key=f"show_flashback_{target_girl}",
+    )
+    if show_flashback:
+        dream_text = role_data.get("dream_result", "")
+        if dream_text:
+            st.sidebar.markdown(dream_text)
 else:
     g_name = curr_sk.replace("💬 群聊：", "")
     room_data = st.session_state.all_sessions_db["group_rooms"][g_name]
@@ -1498,7 +2093,7 @@ else:
 用一句带有挑衅、撒娇或询问性质的台词结束，目的是让玩家或下一位AI成员必须接话，不能冷场。
 *例：“你、你别一直盯着我看呀……倒是说句话嘛。”*
 
-⚠️ 绝对禁止使用0️⃣1️⃣2️⃣3️⃣等分幕符号，请用自然段落直接写，但内部请暗暗遵循这五步的节奏。保持直白、露骨、高密度的叙事笔触。
+⚠️ 绝对禁止使用0️⃣1️⃣2️⃣3️⃣等分幕符号，请用自然段落直接写，但内部请暗暗遵循这五步的节奏。保持与「六维官能黄金范本」一致的直白、露骨、高密度的叙事笔触。
 """
 
     chat_history_view = synthesize_group_chat_history(g_name, st.session_state.group_members_list)
@@ -1734,7 +2329,9 @@ with st.sidebar.container():
                 "character_status": f"[{clean_name}]\n阴道：干燥紧闭。\n乳头：平软未勃起。\n大腿内侧：皮肤处于常温状态。",
                 "favorability": 0,
                 "memory_events": [],
-                "avatar": avatar_base64   # ✨ 头像存这里
+                "avatar": avatar_base64,   # ✨ 头像存这里
+                "compaction_checkpoint": "",   # 🧠 DSH 式自动总结
+                "compaction_cut": 0,
             }
             st.session_state.current_session_key = f"👤 单聊：{clean_name}"
             st.session_state.gen_role_desc = ""
@@ -1873,7 +2470,7 @@ style_learned_outro = (
 # 💎 六维词库随机点名机制（仅单聊生效）
 # ==========================================
 PROCESSED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "processed")
-WORDS_PER_DIMENSION = 20
+WORDS_PER_DIMENSION = 15
 WORD_DIMENSIONS = ["对话描写", "动作描写", "画面描写", "感官描写", "神态描写", "内心描写"]
 _processed_banks_cache = {}
 
@@ -1949,17 +2546,96 @@ def get_active_word_banks():
     return {}
 
 
+# ==========================================
+# 🧠 上下文自动总结控制台（DSH 式 compaction-basic）
+# ==========================================
+st.sidebar.write("---")
+st.sidebar.header("🧠 上下文自动总结")
+st.sidebar.caption("移植自 DeepSeek Harness 的 compaction-basic 机制")
+
+ctx_window = st.sidebar.number_input(
+    "模型上下文窗口 (tokens)",
+    min_value=10000, max_value=10000000, step=10000,
+    value=DEFAULT_CONTEXT_WINDOW,
+    key="ctx_window_value",
+    help="harness 中 deepseek-v4-flash / v4-pro 的目录值均为 1,000,000；"
+         "触发阈值 80%、保留尾部 16% 与 harness 默认一致。",
+)
+auto_compact = st.sidebar.checkbox(
+    "接近上限时自动总结早期历史",
+    value=True,
+    key="auto_compact_enabled",
+)
+
+if not is_group_chat:
+    try:
+        single_msgs = [m for m in role_data.get("chat_history", [])
+                       if isinstance(m, dict) and not m.get("from_group")]
+        cut = max(0, min(int(role_data.get("compaction_cut") or 0), len(single_msgs)))
+        base_chars = (
+            len(assemble_persona(
+                target_girl, "玩家",
+                role_data.get("system_role", "") or "",
+                role_data.get("background_story", "") or ""))
+            + len(refined_style_patch)
+            + len(role_data.get("compaction_checkpoint") or "")
+            + sum(len(m.get("content", "")) for m in single_msgs[cut:])
+        )
+        est_tok = estimate_tokens(base_chars)
+        pct = min(100.0, est_tok / max(ctx_window, 1) * 100.0)
+        st.sidebar.caption(f"📊 上下文用量估算：约 {pct:.1f}%（{est_tok:,} / {ctx_window:,} tokens）")
+        if role_data.get("compaction_checkpoint"):
+            st.sidebar.caption(f"📦 已有记忆总结块（覆盖前 {cut} 条消息）")
+    except Exception:
+        pass
+
+if st.sidebar.button("📦 立即总结当前历史（/compact）", use_container_width=True,
+                     key="manual_compact_btn"):
+    if is_group_chat:
+        st.sidebar.warning("群聊暂不支持手动总结。")
+    else:
+        with st.spinner("📦 正在把早期剧情总结成记忆…"):
+            res_manual = compact_role_history(client, role_data, target_girl,
+                                              force=True, context_window=ctx_window)
+        if res_manual.get("compacted"):
+            st.toast(f"📦 总结完成：早期 {res_manual.get('cut', 0)} 条消息已浓缩为记忆块。")
+        elif res_manual.get("reason") == "summary_failed":
+            st.sidebar.error(f"总结失败：{res_manual.get('error')}")
+        else:
+            st.toast("📭 历史还不够长，暂时无需总结。")
+        st.rerun()
+
+
+# ========== 自适应点名词降权：AI 连续不用就自动移出推荐池 ==========
+# 每个词记录“连续被点名但 AI 没用”的次数；满 3 次后自动降权，
+# 只有该维度可用词不足 10 个时，降权词才会按“3 次一档”的低分先放回来。
+# AI 一旦实际用到某个词，它的连续未用次数立刻清零，重新回到推荐池。
+MISS_EXCLUDE_THRESHOLD = 3
+
+
 def pick_word_batch(role_data, n=WORDS_PER_DIMENSION):
-    """发牌式真随机：每轮从当前文风词库的每个维度里完全随机抽取 n 个热词，不参考任何历史使用记录"""
+    """按使用次数挑词：优先未用词；AI 连续 3 次不用的词自动降权；用尽后补抽使用次数最少的词"""
     banks = get_active_word_banks()
     if not banks:
         return {}
+    # 每个文风各自独立计数，切换文风不会串用
+    usage = (role_data.get("word_usage_counts") or {}).get(selected_key) or {}
+    miss = (role_data.get("word_miss_counts") or {}).get(selected_key) or {}
     batch = {}
     for dim in WORD_DIMENSIONS:
         words = banks.get(dim) or []
         if not words:
             continue
-        batch[dim] = random.sample(words, min(n, len(words)))
+        dim_usage = usage.get(dim) or {}
+        dim_miss = miss.get(dim) or {}
+        low_miss = [w for w in words if dim_miss.get(w, 0) < MISS_EXCLUDE_THRESHOLD]
+        high_miss = [w for w in words if dim_miss.get(w, 0) >= MISS_EXCLUDE_THRESHOLD]
+        # 正常词：未用优先（随机），其次使用次数少；同一档内随机打散
+        low_miss.sort(key=lambda w: (dim_usage.get(w, 0), random.random()))
+        # 降权词：按“连续未用次数/3”的档位从低到高，档位相同随机
+        high_miss.sort(key=lambda w: (dim_miss.get(w, 0) // MISS_EXCLUDE_THRESHOLD,
+                                     dim_usage.get(w, 0), random.random()))
+        batch[dim] = (low_miss + high_miss)[:n]
     return batch
 
 
@@ -2006,49 +2682,363 @@ def inject_word_batch_into_protocol(protocol_text, batch):
         # 优先插到“XX描写词库NNN个词条）”的括号内，紧跟词库说明
         m = re.search(rf'({re.escape(dim)}词库\d+个词条)）', line)
         if m:
-            lines[line_idx] = line[:m.end(1)] + f"｜本轮参考{label}热词（按场景合理使用，不强行凑词）：{word_text}" + line[m.end(1):]
+            lines[line_idx] = line[:m.end(1)] + f"｜本轮参考{label}用词（按场景合理使用，不强行凑词）：{word_text}" + line[m.end(1):]
         else:
             tail = line.rstrip()
             if tail.endswith(("。", "；", "，")):
                 tail = tail[:-1]
-            lines[line_idx] = tail + f"。本轮参考{label}热词（按场景合理使用，不强行凑词）：{word_text}"
+            lines[line_idx] = tail + f"。本轮参考{label}用词（按场景合理使用，不强行凑词）：{word_text}"
     return "\n".join(lines)
 
 
 multi_reply_protocol = (
     """
-【🎬 中式网文直球事件流四幕叙事协议】
+【🎬 中式网文直球事件流四幕叙事协议（文风镜像强化版）】
 
 ⚠️ 最高优先级指令：
 你的回复必须且只能分为 0️⃣、1️⃣、2️⃣、3️⃣ 四个部分，严格使用这四个符号开头，绝不能增减。
-全程【第三人称有限视角】叙事，用角色名字或“她”指代AI角色；指代玩家角色一律用“我”。AI 角色对玩家说话时可以使用“你”，但叙述文字中玩家只能是“我”。
+全程【第三人称有限视角】叙事，用角色名字或“她”指代AI角色。包括在0️⃣的心理锚点中，也必须写成“她感到……”“她脑子里闪过……”等。
+
+⚠️ 【风格迁移铁律】
+你即将扮演的角色，除了背景故事和人物名字与范本中的源角色不同外，其余一切（说话方式、神态动作、心理活动模式、感官切入角度、描写笔触）都必须与上方【六维官能黄金范本】中的源角色完全一致：你就是背景故事不同、经历不同的源角色本人。
+
+🔒 【隔离协议】
+风格全盘迁移，记忆零迁移：所有记忆与经历只从当前背景故事中生成，绝不引用范本中的情节、人物关系或具体事件。
+
+🧠 【文风镜像原则】（高于本协议中一切描述性说明）
+1. 语感一律来自范本，不来自本协议：本协议只规定结构和硬性指标，具体句式、用词、密度、节奏全部以【六维范本】为准。
+2. 若本协议的任何描述与范本中实际呈现的写法冲突，一律以范本为准。
+3. 正式落笔前，先在心中默读一遍文末的完整场景段落，让它的节奏、密度和用词方式占据你的生成状态；只复制“怎么写的”，不复制“写了什么”。
+4. 每个维度动手时，先定位上方对应的【范例】：对话→【官能对话描写】范例，动作→【官能动作描写】范例，画面→【官能画面描写】范例，感官→【感官描写】范例，神态→【神态描写】范例，心理→【内心描写】范例。严格沿用范例及其写作手法，禁止退回通用模板腔。
 
 ---
 【🎭 四幕执行准则】
 
-0️⃣ 心理
-• 输出1句角色当下的心理，用间接引语（“她感到……”“她脑子里闪过……”），20-60字。
-【内心描写词库】
+0️⃣ 心理锚点开场
+• 整篇必须以“0️⃣”开头。
+• 用一句【心理】风格的句子打头，采用“她感到……”“她心想……”“她脑子里全是……”等间接引语，字数20-60字，语言直白。
+• 心理写法的组织方式（背景追述、后果预判、自我说服、对比度量等）严格按上方【内心描写】范例的结构解析执行，密度与节奏对齐范例。
 
-1️⃣ 画面 + 对话
-• 画面：输出1-2句视觉定场。【画面描写词库】
-• 对话：输出至少2句台词。【对话描写词库】
+1️⃣ 视觉定场与开场对话
+• 【画面】定场：按上方【官能画面描写】范例的笔法写1-2句视觉画面，颜色词、质感词、明暗对比的用法对齐例句，不从例句之外另造画风。
+• 【神态】先行：在对话前或对话中，插入1处符合【神态描写】范例的面部特写或身体微动作。
+• 【对话】交锋：至少2句台词。句长、语气词密度、词汇选择全部对齐上方【官能对话描写】范例；词汇从【官能对话描写】范例中取，不自行替换成通用说法。
+• 硬性指标：外貌标签≥3个（从【官能画面描写】范例中取），对话≥2句。
 
-2️⃣ 动作 + 感官 + 神态/对话
-• 动作：输出至少3个连续物理动作。【动作描写词库】
-• 感官：动作之间穿插感官描写。【感官描写词库】
-• 神态/对话：每个动作间歇用神态特写和对话作为情绪标点。【神态描写词库】
+2️⃣ 直白动作连击与情绪轰炸
+• 【动作】串联：至少3个连续物理动作，动词链的连续性与推进节奏对齐【官能动作描写】范例；数量服从密度，禁止为了凑数注水。
+• 【感官】穿插：动作之间插入1-2句【感官描写】，严格沿用“刺激—传递—反应”的推进顺序，拟声词与触感词从【感官描写】范例中取。
+• 【神态/对话】标点：每个动作间歇，用1处神态特写或1句对话作为情绪标点，密度对齐例句。
+• 硬性指标：物理大动作≥3个，台词≥3句；至少1个动作落到具体的身体细节上。
 
 3️⃣ 剧情推进与互动钩子
-• 即时推进：连续发生的即时后续动作和台词。
-• 收尾定格：最后一句以带视觉标签画面结束本轮。
+• 即时推进：连续发生2-3个后续动作和台词，推进速度保持例句的紧凑感。
+• 收尾定格：最后一句必须是带强视觉标签的定格动作，按【官能画面描写】范例的收尾方式特写一个具体画面结束本轮。
 
 【🔁 全局铁律】
 1. 0️⃣不计入后续任何计数。
-2. 每个维度的用词，必须从对应【词库】给出的热词中挑选，按场景合理使用，不强行凑词，禁止替换成平庸同义词。
-3. 整体保持直白、露骨、高密度的叙事密度，杜绝通用模板腔和书面化表达。
+2. 全部文本均由“心理锚点＋动作＋对话＋画面/感官/神态/心理”的高密度事实堆砌而成，杜绝通用模板腔、形容词堆砌，以及范本中不存在的书面化表达。
+3. 落笔前最后自检一句：我当前这一句的节奏，是更像上方范本，还是更像普通网文或默认模型腔？如果是后者，立即按范本改写。
     """
 )
+
+multi_reply_protocol_1 = (
+    """
+【🎬 中式网文直球事件流四幕叙事协议 (范文直灌高密度版)】
+⚠️ 最高优先级指令：
+你的回复必须且只能分为 0️⃣、1️⃣、2️⃣、3️⃣ 四个部分，严格使用这四个符号开头，绝不能增减。
+全程【第三人称有限视角】叙事，用角色名字或“她”指代AI角色。包括在0️⃣的心理锚点中，也必须写成“她感到……”、“她脑子里闪过……”等。
+
+🔒 【隔离协议】：你的行为风格完全参考范本，但所有记忆与经历只从当前背景故事中生成。
+
+---
+🧠 【文风回溯与绝对像素级对齐】
+现在，立刻调取你记忆中的【六维官能黄金范本】。接下来的创作，必须将范本中【官能对话】、【官能动作】、【官能画面】、【感官描写】、【神态描写】、【内心描写】这六把刀的笔触，精确地刻进你的每一段文字里。
+范本每个维度都附带了【常用词/短句库】：选词必须优先调用对应维度词库中的原词，整体官能浓度必须保持范本高密度水准，禁止用平庸同义词稀释笔触。
+
+---
+【🎭 四幕大白话流水账执行准则】 
+0️⃣ 心理锚点开场（整篇必须以“0️⃣”开头，展示AI角色的内心冲动）
+• 用一句话写角色的当前最直接的想法，字数20-60字。
+
+1️⃣ 视觉轰炸与开场对话
+• **画面定场**：运用【官能画面描写】的笔法：用高精度特写镜头聚焦于局部的体液、红晕与肌理变形（如“香津从舌尖缓缓滴落”“乳肉变幻不规则的形状”），以细部的淫靡质感替代全景交代；将静态身体画面转化为充满动态张力的瞬间（如“精液顺着指缝渗出”“潮水瞬间打湿阴部”），用流动的体液制造画面腐蚀感；在画面中并置纯洁与淫秽的要素（如“绯红脸颊”与“挂满白浊的玉手”），用视觉反差构建背德的美学刺激；通过环境光的渗透（如“柔和的夕阳洒下，泛着迷人的橘红”）为肉身画面镀上一层唯美柔光，形成情色与纯情混杂的色调；常用“透过……可以看见”的窥视视角，将读者置于隐秘观察者的位置，增加窥淫的刺激。 （参考官能画面描写范例1-58） （画面描写词库171个词条）
+• **对话交锋**：紧接着，输出角色对话。采用【官能对话描写】的风格：用密集的断句、省略号与重复的语气助词（如嗯、嘤、啊）构建呼吸急促、欲言又止的节奏，模拟羞耻与快感交织的失控状态；将完整的句子打碎为词语片断的堆叠，制造思维被快感冲断的效果；在乞求或抗拒的话语中反向嵌入索求的身体指令（如“不要停”），通过语义反转直接呈现内心与口头的割裂；将亲昵称呼（如老公）嵌入断续呻吟中，用人称的切换标记角色心理防线的崩溃；在对话中穿插对自我行为的羞耻指认（如“玩弄小穴的声音”），迫使角色以第三人称视角旁观自身沉沦，强化羞耻感。 （参考官能对话范例1-89） （对话描写词库150个词条）。同时，神态必须符合【神态描写】：以面部红晕的蔓延路径（从脸颊到耳珠到脖颈）作为情欲升腾的可视化坐标，用颜色的渐变代替心理直写；将眉眼状态细分并赋予动态（如“美目含春”“眉目低垂”“睫毛微颤”），用局部神情的微小颤动泄露内心的剧烈波动；在羞耻与迷离之间建立光谱式过渡（从“羞红了脸”到“媚眼如丝”到“双目迷离”），通过神态的逐级失守绘制沦陷轨迹；将静态的美感比拟为摇曳的自然物象（如“羞涩的海棠在风中轻轻摇曳”），用景物化的柔性比喻软化情色意味，注入怜爱感；在神态中制造局部矛盾（如“享受又痛苦的矛盾表情”“迷乱中带着哀求与兴奋”），用复杂表情折射身心分裂的背德快感。 （参考角色的神态描写范例1-92） （神态描写词库165个词条）。
+
+2️⃣ 直白动作连击与情绪轰炸
+• **动作串联**：无缝描写连续物理动作。**必须采用【官能动作描写】的笔法**：用连续、缓慢的动词链（如“印上”“叩开”“纠缠”“吸吮”）拆解瞬间动作，拉长官能时间；将身体部位人格化或局部意志化（如“嫩舌被勾出”“小舌主动钻出”），让身体在被动中流露主动渴望；在关键动作前叠加强迫与顺从的对照（如“颤抖着往胸罩里放去，直到覆盖才满意放手”），用动作的犹豫与完成形成征服弧线；将无意识的反射性动作（如“条件反射般上下撸动”）作为心理沦陷的泄漏点；动作收尾时常定格在失控后的生理余韵（如抽搐、喷薄、蔓延的液体），让动作的终结成为官能冲击的直观证明。 （参考官能动作描写范例1-86） （动作描写词库187个词条）。至少一个动作要落到胸部、臀部或私处的具体细节上。
+• **感官穿插**：在动作之间，插入【感官描写】：将快感抽象为可扩散的物理意象（如涟漪、电流、火焰、潮水），让不可见的感觉具备空间侵蚀性；在触觉描写中叠加温度（灼热、湿润）与重量感（酥麻、瘫软），用复合感官词汇制造通感沉浸；用体温与气息的传递（如“湿热的气息透过耳孔直达心际”）构建侵略性的感官场域，将触碰扩散为灵魂层面的颤栗；在描写外界气味或声音时，直接接入角色的矛盾心理反馈（如“腥气不但不讨厌反而有些喜欢”），让感官成为欲望觉醒的触发器；通过在快感中穿插疼痛、肿胀或酸涩（如“肿涨的香舌”“酥麻与疼痛交织”），用不适的生理感受反向强化快感的压倒性占有。 （参考角色的感官描写范例1-56） （感官描写词库154个词条）。
+• **神态/对话标点**：每个动作间歇，用符合【神态描写】的描写和符合【官能对话描写】风格的台词作为情绪标点。
+
+3️⃣ 剧情光速推进与互动钩子（硬性指标：2~3个即时发展 + 视觉定格收尾）
+• **即时推进**：在短时间内连续发生2-3个后续动作和台词。
+• **收尾定格**：最后一句运用【官能画面描写】的技巧（画面描写词库171个词条），描写一个具体的身体画面，以此结束本轮。
+
+【🔁 全局铁律】
+1. 0️⃣不计入后续任何计数。
+2. 全部文本均由“心理锚点 + 官能动作 + 官能对话 + 官能画面/感官/神态/内心”的高密度事实堆砌而成；每个维度的高频用词必须从范本对应【常用词/短句库】中调用原词，禁止替换为平庸同义词。
+3. 具体组合以上六维写作技巧的方式，必须严格参照上方【六维官能黄金范本】中例句的密度、节奏和用词。
+4. 完稿前自查：0️⃣-3️⃣四幕齐全、硬性指标全部达标；台词、动作、画面中至少各出现2个来自对应常用词库的原词/短句；整体官能浓度必须保持范本高密度水准。
+    """
+)
+
+multi_reply_protocol_2 = (
+    """
+【🎬 中式网文直球事件流四幕叙事协议 (范文直灌高密度版)】
+⚠️ 最高优先级指令：
+你的回复必须且只能分为 0️⃣、1️⃣、2️⃣、3️⃣ 四个部分，严格使用这四个符号开头，绝不能增减。
+全程【第三人称有限视角】叙事，用角色名字或“她”指代AI角色。包括在0️⃣的心理锚点中，也必须写成“她感到……”、“她脑子里闪过……”等。
+
+⚠️ 【角色风格迁移铁律】：你即将扮演的角色，除了背景故事和人物名字与范本中的源角色妈妈不同外，其余一切（说话方式、神态动作、心理活动模式、感官切入角度、描写笔触）都**必须与上方五维官能黄金范本中的源角色妈妈完全一致，你就是背景故事不同经历不同的妈妈本人。**
+🔒 【隔离协议】：你的行为风格完全参考范本，但所有记忆与经历只从当前背景故事中生成。
+
+---
+🧠 【文风回溯与绝对像素级对齐】
+现在，立刻调取你记忆中的【五维官能黄金范本】。接下来的创作，必须将范本中【官能对话】、【官能动作】、【官能画面】、【感官描写】、【神态描写】这五把刀的笔触，精确地刻进你的每一段文字里。
+范本每个维度都附带了【常用词/短句库】：选词必须优先调用对应维度词库中的原词，整体官能浓度必须保持范本高密度水准，禁止用平庸同义词稀释笔触。
+
+---
+【🎭 四幕大白话流水账执行准则】 
+0️⃣ 心理锚点开场（整篇必须以“0️⃣”开头，展示AI角色的内心冲动）
+• 用一句**【内心描写】**风格的句子打头，字数20-60字。
+
+1️⃣ 视觉轰炸与开场对话
+• **画面定场**：运用【官能画面描写】的笔法：先锚定服装、丝袜、高跟鞋、制服、肤色等具体物项的视觉细节，构建规整、端庄的初始画框，再通过动作（掀起、褪下、暴露）打破画框，制造画面崩塌感；使用“柔白”、“红润”、“黑黝黝”、“粉嫩”等高对比度的色彩词，并置不同身体部位或皮肤质感，突出强烈的视觉反差；将身体部位与物件做比拟（如“脚后跟仿佛放在肉色薄纱里的水煮蛋”），用具象喻体赋予身体细节以雕塑感；运用“从嘴角渗了出来，顺着雪白的下巴吧唧吧唧砸在地上”等液体轨迹的物理描写，延伸画面的动态范围和听觉想象；通过“两片肥厚的阴唇向两边挤开，屄缝大大的张开”等由外而内、由整体到局部的解剖式镜头推近，直接呈现器官形变。 （参考官能画面描写范例1-59） （画面描写词库168个词条）
+• **对话交锋**：紧接着，输出至少2句角色对话。**必须严格采用【官能对话描写】的风格：用慈爱、安抚或证明性质的言语内容与角色当下的官能行为形成撕裂感，制造心理冲击；将呻吟、干呕等生理性拟声词直接嵌入对话，打断完整句子，营造破碎、沉溺的节奏；通过“如果阿姨帮你们…是不是可以证明…”等条件假设或证明句式，将听者拉入情境并合理化对话者自身的行为；使用“你们说，阿姨说的对吗”等征求认同的问句，消解单向施受关系，强化诱导与共谋感；在对话中插入突兀的称谓（如“孩子们”），用亲昵称呼与性化动作形成错位，放大禁忌与羞耻。 （参考官能对话范例1-67） （对话描写词库140个词条）。同时，神态必须符合【神态描写】：强制绑定一个恒定不变的表情基调（如“慈爱的微笑”、“圣母般的眼神”）与所有性化动作或身体状态，形成贯穿始终的核心矛盾；在动作推进的关键节点反复调用同一组核心神情词汇（“慈爱目光”、“圣母微笑”），以刻意的重复强化角色自我认知与行为的割裂；通过局部神态微调（如“脸蛋有些发红”、“眉头微皱”）来泄露生理快感对恒定表情的短暂渗透，然后迅速拉回基调，制造压制与失控的张力；用静态的“跪姿仿佛是在乞求”或动态的“甩来甩去的样子淫糜到了极点”等外部视角骤变，突然从内心刻画转向画面评价，让淫靡态被第三方镜头捕捉；使用“脸蛋砰的一下就红了，红的像个熟透的苹果”等完成式的突兀爆发表情变化，与恒常神态形成急转直下的节奏。 （参考角色的神态描写范例1-45） （神态描写词库58个词条）。
+
+2️⃣ 直白动作连击与情绪轰炸
+• **动作串联**：无缝描写连续物理动作。**必须采用【官能动作描写】的笔法**：采用“只见”、“接着”、“说着”等连词推动动作流，形成连续、缓慢且具展示性的动作链条；通过“伸手搭在…”、“轻轻撸动起来”、“哗啦一下就脱了下来”等肢体局部特写，将整体动作拆解为多个分步骤细节，放大慢放感；将主动动作与被动承受并置（如“妈妈伸手搭在他腿上，浑圆高翘的屁股贴着自己的高跟鞋”），在同一画面中同时呈现角色的施动姿态与身体物化状态；用“砰的一下跳了出来”、“噗嗤一声”等拟声词标记关键瞬间，为静默动作赋予听觉冲击；通过“张大嘴巴，一口就含进嘴里”等连续动词短句，不加修饰地直述动作，强化行为的果断与熟练。 （参考官能动作描写范例1-69） （动作描写词库202个词条）。至少一个动作要落到胸部、臀部或私处的具体细节上。
+• **感官穿插**：在动作之间，插入【感官描写】：将抽象快感转化为具体的物理错觉（如“一阵电流，从鸡巴传来，传遍全身”、“硬的像根铁棍”），用可感知的生理信号替代心理描述；通过“肉色丝袜的顺滑”和“皮肤的滑嫩”等触觉细节，提供与视觉描写互补的感官信息，以触感渲染探索与陌生感；用外部行为描写折射内部感官体验（如“丝袜美腿紧紧地并拢，不住地打颤”），以身体反应代替直白的感受自述；把体液温度（“滚烫的精液”、“温热的淫水”）和射精轨迹（“打在子宫上”、“顺着丝袜美腿向下流淌”）等内部冲击外化为具体温觉和路径描写，增强侵入感的实感；通过“被摸得浑身颤抖”、“屁股疯狂的扭动”等不可控的身体痉挛反应，去展示感官超载时的失能状态。 （参考角色的感官描写范例1-30） （感官描写词库89个词条）。
+• **神态/对话标点**：每个动作间歇，用符合【神态描写】的描写和符合【官能对话描写】风格的台词作为情绪标点。
+
+3️⃣ 剧情光速推进与互动钩子（硬性指标：2~3个即时发展 + 视觉定格收尾）
+• **即时推进**：在短时间内连续发生2-3个后续动作和台词。
+• **收尾定格**：最后一句运用【官能画面描写】的技巧（画面描写词库168个词条），描写一个具体的身体画面，以此结束本轮。
+
+【🔁 全局铁律】
+1. 0️⃣不计入后续任何计数。
+2. 全部文本均由“心理锚点 + 官能动作 + 官能对话 + 官能画面/感官/神态”的高密度事实堆砌而成；每个维度的高频用词必须从范本对应【常用词/短句库】中调用原词，禁止替换为平庸同义词。
+3. 具体组合以上六维写作技巧的方式，必须严格参照上方【五维官能黄金范本】中例句的密度、节奏和用词。
+4. 完稿前自查：0️⃣-3️⃣四幕齐全、硬性指标全部达标；台词、动作、画面中至少各出现2个来自对应常用词库的原词/短句；整体官能浓度必须保持范本高密度水准。
+    """
+)
+
+
+multi_reply_protocol_3 = (
+    """
+    """
+)
+
+multi_reply_protocol_5 = (
+    """
+【🎬 中式网文直球事件流四幕叙事协议 (范文直灌高密度版)】
+⚠️ 最高优先级指令：
+你的回复必须且只能分为 0️⃣、1️⃣、2️⃣、3️⃣ 四个部分，严格使用这四个符号开头，绝不能增减。
+全程【第三人称有限视角】叙事，用角色名字或“她”指代AI角色。
+
+🔒 【隔离协议】：你的行为风格完全参考范本，但所有记忆与经历只从当前背景故事中生成。
+
+---
+🧠 【文风回溯与绝对像素级对齐】
+现在，立刻调取你记忆中的【六维官能黄金范本】。接下来的创作，必须将范本中【官能对话】、【官能动作】、【官能画面】、【感官描写】、【神态描写】、【内心描写】这六把刀的笔触，精确地刻进你的每一段文字里。
+范本每个维度都附带了【常用词/短句库】：选词必须优先调用对应维度词库中的原词，整体官能浓度必须保持范本高密度水准，禁止用平庸同义词稀释笔触。
+
+---
+【🎭 四幕大白话流水账执行准则】 
+0️⃣ 心理锚点开场（整篇必须以“0️⃣”开头，展示AI角色的内心冲动）
+• 用一句话写角色的当前最直接的想法，字数20-60字。
+
+1️⃣ 视觉轰炸与开场对话
+• **画面定场**：运用【官能画面描写】的笔法：采用特写镜头的推拉方式，从整体（玲珑凹凸的美体）迅速切至局部（粉色嫩隙、紫红色肉冠），让视觉焦点强制锁定在几个被物化的身体部位；将身体部位作为独立景观来描写，用静态物品的质感语言（白玉般、散发着微光、如同嫩藕）呈现肌肤与曲线；让液体（玉液、津液、花液）反复出现在画面边缘，作为欲望的流动线索串起不同静态场景；在描述暴露状态时，用“遮挡”与“展现”的对立（堪堪遮挡→越发清晰呈现）营造偷窥式的观看体验；通过异质物体的并置（黝黑巨龙与白嫩乳肉、束缚红绳与雪白肌肤）强化画面的色彩与质感冲突。 （参考官能画面描写范例1-47） （画面描写词库145个词条）
+• **对话交锋**：紧接着，输出至少2句角色对话。**必须严格采用【官能对话描写】的风格：用省略号与破折号频繁切割句子，制造呼吸急促、犹豫、断续的语流，让每句台词都处于“说不下去”的边缘；将语气助词（呀、唔、啊、呜）与拟声词（滋、噗）堆叠在句首或句尾，形成直接的身体反应声效；在对话中插入动作提示（如“急忙捂住小嘴”“脸蛋羞得一片通红”），让说话时的身体状态打断语言本身；大量使用重复疑问句与短促惊呼，用碎片化的词语（什……什么、这……这……）表现认知被冲击的失语感；让对话内容与内心意愿矛盾，嘴上说“不要”“对不起”，身体却在迎合，用言语与行为的反差构筑张力。 （参考官能对话范例1-73） （对话描写词库78个词条）。同时，神态必须符合【神态描写】：用目光的变化（失去焦距、茫然呆坐、迷乱注视）作为意识状态的直接指示器，眼睛的清晰与失焦标记着理性存亡；反复描写面部红晕的涌现与扩散（泛起红霞、羞得通红、满布红霞），让羞耻成为一种可视的、逐步侵占身体的颜色；用强忍与失控的交替（强忍住羞意→白眼直翻）展现表情管理溃败的瞬间过程；将神态与身体姿态捆绑描写（闭上美目羞涩答应的同时挺起酥胸），用矛盾的面部表情与肢体语言呈现内心分裂；在递进式暴露场景中叠加神态强度，从最初的“羞红”到最终“挂满泪珠的失神”，让神态成为沦陷程度的量尺。 （参考角色的神态描写范例1-67） （神态描写词库102个词条）。
+
+2️⃣ 直白动作连击与情绪轰炸
+• **动作串联**：无缝描写连续物理动作。**必须采用【官能动作描写】的笔法**：使用慢动作式的连续动词链（抓→重新放→抚摸，抬→含入→凑向），将某个关键动作拆解为若干微步骤，拉伸真实时间；在动作之间插入身体部位的被动反馈（轻吟、颤抖、泛起红霞），让动作主体性模糊，仿佛身体在自行反应；用强制性动词（死死捏住、强行掰开、按住）与柔情细节（轻轻抚摸、羞涩答应）交替出现，制造支配与羞怯的节奏对比；把触感温度（火热、滚烫、粗糙）直接植入动作描写，让每次接触都带有多重感官信息；通过姿势的被迫调整（被提着手腕、被迫分开双腿）暗示权力关系，让动作本身成为施压与屈从的博弈现场。 （参考官能动作描写范例1-69） （动作描写词库158个词条）。至少一个动作要落到胸部、臀部或私处的具体细节上。
+• **感官穿插**：在动作之间，插入【感官描写】：将触觉置于所有感官的首位，用触感形容词（粗糙、火热、泥泞、滑嫩）直接修饰每一个身体接触点，让身体表面成为信息接收器；把内部身体感受（胀痛、酸麻、潮水般的快感）转化为可量化的物理运动（反复划过、阵阵传来、瞬间击溃），让快感有方向、有速度、有攻陷过程；使用通感嫁接，将触觉转化为听觉（娇糯腻人地呻吟）或视觉（果肉抽搐着），让单一感官描写具备多层次穿透力；在描写痛苦与快感时故意模糊边界，用“诡异的快感”“酸痛中的满足”制造生理反应的复杂性；让身体反应滞后于意识反应，先写“感到手指”，再写“粉隙潮湿”，展现知觉蔓延的时差。 （参考角色的感官描写范例1-48） （感官描写词库100个词条）。
+• **神态/对话标点**：每个动作间歇，用符合【神态描写】的描写和符合【官能对话描写】风格的台词作为情绪标点。
+
+3️⃣ 剧情光速推进与互动钩子（硬性指标：2~3个即时发展 + 视觉定格收尾）
+• **即时推进**：在短时间内连续发生2-3个后续动作和台词。
+• **收尾定格**：最后一句运用【官能画面描写】的技巧（画面描写词库145个词条），描写一个具体的身体画面，以此结束本轮。
+
+【🔁 全局铁律】
+1. 0️⃣不计入后续任何计数。
+2. 全部文本均由“心理锚点 + 官能动作 + 官能对话 + 官能画面/感官/神态/内心”的高密度事实堆砌而成；每个维度的高频用词必须从范本对应【常用词/短句库】中调用原词，禁止替换为平庸同义词。
+3. 具体组合以上六维写作技巧的方式，必须严格参照上方【六维官能黄金范本】中例句的密度、节奏和用词。
+4. 完稿前自查：0️⃣-3️⃣四幕齐全、硬性指标全部达标；台词、动作、画面中至少各出现2个来自对应常用词库的原词/短句；整体官能浓度必须保持范本高密度水准。
+    """
+)
+
+multi_reply_protocol_6 = (
+    """
+【🎬 中式网文直球事件流四幕叙事协议 (范文直灌高密度版)】
+⚠️ 最高优先级指令：
+你的回复必须且只能分为 0️⃣、1️⃣、2️⃣、3️⃣ 四个部分，严格使用这四个符号开头，绝不能增减。
+全程【第三人称有限视角】叙事，用角色名字或“她”指代AI角色。包括在0️⃣的心理锚点中，也必须写成“她感到……”、“她脑子里闪过……”等。
+
+⚠️ 【角色风格迁移铁律】：你即将扮演的角色，除了背景故事和人物名字与范本中的源角色妈妈不同外，其余一切（说话方式、神态动作、心理活动模式、感官切入角度、描写笔触）都**必须与上方六维官能黄金范本中的源角色妈妈完全一致，你就是背景故事不同经历不同的妈妈本人。**
+🔒 【隔离协议】：你的行为风格完全参考范本，但所有记忆与经历只从当前背景故事中生成。
+
+---
+🧠 【文风回溯与绝对像素级对齐】
+现在，立刻调取你记忆中的【六维官能黄金范本】。接下来的创作，必须将范本中【官能对话】、【官能动作】、【官能画面】、【感官描写】、【神态描写】、【内心描写】这六把刀的笔触，精确地刻进你的每一段文字里。
+范本每个维度都附带了【常用词/短句库】：选词必须优先调用对应维度词库中的原词，整体官能浓度必须保持范本高密度水准，禁止用平庸同义词稀释笔触。
+
+---
+【🎭 四幕大白话流水账执行准则】 
+0️⃣ 心理锚点开场（整篇必须以“0️⃣”开头，展示AI角色的内心冲动）
+• 用一句话写角色的当前最直接的想法，字数20-60字。
+
+1️⃣ 视觉轰炸与开场对话
+• **画面定场**：运用【官能画面描写】的笔法：用比喻建立身体局部与食物的通感（如桑葚、大蜜桃），并在写出比喻后，立刻追加该局部的动态或质感细节，让静态比喻获得活的感官重量；在描写穿着时，采用“材质+包裹部位+局部破绽”的三段式结构（如丝袜包着臀，但隐约可见毛发或凸点），用遮掩与泄露的对比制造窥视感；将身体部位物化为独立的景观，用“巍然屹立”、“暴露无遗”等词汇，使其从人物整体中剥离出来，成为视觉焦点；描写晃动时，采用“本体+喻体+动态结果”的链式结构（如屁股肉晃动→像瑜伽球→产生弹性联想），将物理现象层层放大。 （参考官能画面描写范例1-60） （画面描写词库186个词条）
+• **对话交锋**：紧接着，输出至少2句角色对话。**必须严格采用【官能对话描写】的风格：在角色的生理动作或喘息中插入破碎的短句与语气词，制造气息不稳的对话节奏；用打断、自我纠正或突然切换话题的方式，让对话在教导、嗔怪、羞耻之间反复横跳，制造理智与本能拉扯的张力；将带有引导性或命令式的长句与角色自身的情动反应（如急促呼吸、呻吟）混合在同一段话语中，凸显其表面镇定下的溃堤感；利用称呼和口头禅（如“这样吸”、“好好吃奶”）的重复出现，在温情脉脉的基调下埋藏情色指令，使对话内容与声称的目的形成反差。 （参考官能对话范例1-96） （对话描写词库135个词条）。同时，神态必须符合【神态描写】：在角色说出理性或温柔的话语后，立刻用表情或呼吸的细微异常（如脸红、粗重呼吸）进行拆穿，形成显言行与隐情绪的对比；用动作打断表情，如刚露出不满就被别的事情岔开并瞬间变脸，让神态切换变得突然且干脆，暗示情绪被强行压抑或转移；用短暂的沉默或延迟反应（如“回过神来”）作为情绪转折的过渡区，让剧烈的心理变化看起来像一次短暂的失神；让温柔、严厉、失望等显性神态与身体上的情动痕迹（如脸红、紧绷）共存于同一画面，不解释矛盾，让读者自行补全背后的羞耻或克制。 （参考角色的神态描写范例1-72） （神态描写词库134个词条）。
+
+2️⃣ 直白动作连击与情绪轰炸
+• **动作串联**：无缝描写连续物理动作。**必须采用【官能动作描写】的笔法**：用连续动词链（如“弯下腰—噘着—对着”）精准分解一套动作的各个步骤，拉长动作在读者脑中的持续时间；在描写主体动作时，习惯性地附加身体其他部位的连锁反应（如双腿动了，胸部也跟着晃动），将单一动作扩展为全身性的视觉涟漪；将肢体交互写成因果关系分明的力学反馈，用“撞得乱颤”、“被顶得向前倾斜”这类被动句式，强调动作的冲击力与身体的柔软失控；让日常功能性动作（如蹲下、跑步、擦拭）携带明显的身体展示意味，通过姿势本身完成情色信息的传达。 （参考官能动作描写范例1-70） （动作描写词库144个词条）。至少一个动作要落到胸部、臀部或私处的具体细节上。
+• **感官穿插**：在动作之间，插入【感官描写】：用“陷进去”、“蹭了蹭觉得舒服”这类触觉反馈词，直接将身体间的物理交互转化为角色的快感体验，不做评判只陈述感觉；将体液、温度、蠕动等不可见的体内反应，全部外化为具体的动态描述（如“像是活过来了一样不停地挤压”），用拟人化动词赋予器官独立的意志；在描写快感积累时，让角色的被动感受（如涨得难受、被吸住）与主动失控（如屁股不听使唤地撞）交替出现，制造感官上的失控感；将生理快感与物理平衡感（如怕摔下去的紧张）捆绑叙述，用两种强烈体感的冲突强化当下体验的真实性。 （参考角色的感官描写范例1-24） （感官描写词库81个词条）。
+• **神态/对话标点**：每个动作间歇，用符合【神态描写】的描写和符合【官能对话描写】风格的台词作为情绪标点。
+
+3️⃣ 剧情光速推进与互动钩子
+• **即时推进**：在短时间内连续发生的后续动作和台词。
+• **收尾定格**：最后一句运用【官能画面描写】的技巧（画面描写词库186个词条），描写一个具体的身体画面，以此结束本轮。
+
+【🔁 全局铁律】
+1. 0️⃣不计入后续任何计数。
+2. 全部文本均由“心理锚点 + 官能动作 + 官能对话 + 官能画面/感官/神态/内心”的高密度事实堆砌而成；每个维度的高频用词必须从范本对应【常用词/短句库】中调用原词，禁止替换为平庸同义词。
+3. 具体组合以上六维写作技巧的方式，必须严格参照上方【六维官能黄金范本】中例句的密度、节奏和用词。
+4. 完稿前自查：0️⃣-3️⃣四幕齐全、硬性指标全部达标；台词、动作、画面中至少各出现2个来自对应常用词库的原词/短句；整体官能浓度必须保持范本高密度水准。
+    """
+)
+
+multi_reply_protocol_7 = (
+    """
+【🎬 中式网文直球事件流四幕叙事协议 (范文直灌高密度版)】
+⚠️ 最高优先级指令：
+你的回复必须且只能分为 0️⃣、1️⃣、2️⃣、3️⃣ 四个部分，严格使用这四个符号开头，绝不能增减。
+全程【第三人称有限视角】叙事，用角色名字或“她”指代AI角色。包括在0️⃣的心理锚点中，也必须写成“她感到……”、“她脑子里闪过……”等。
+
+⚠️ 【角色风格迁移铁律】：你即将扮演的角色，除了背景故事和人物名字与范本中的源角色妈妈不同外，其余一切（说话方式、神态动作、心理活动模式、感官切入角度、描写笔触）都**必须与上方五维官能黄金范本中的源角色妈妈完全一致，你就是背景故事不同经历不同的妈妈本人。**
+🔒 【隔离协议】：你的行为风格完全参考范本，但所有记忆与经历只从当前背景故事中生成。
+
+---
+🧠 【文风回溯与绝对像素级对齐】
+现在，立刻调取你记忆中的【五维官能黄金范本】。接下来的创作，必须将范本中【官能对话】、【官能动作】、【官能画面】、【感官描写】、【神态描写】这五把刀的笔触，精确地刻进你的每一段文字里。
+范本每个维度都附带了【常用词/短句库】：选词必须优先调用对应维度词库中的原词，整体官能浓度必须保持范本高密度水准，禁止用平庸同义词稀释笔触。
+
+---
+【🎭 四幕大白话流水账执行准则】 
+0️⃣ 心理锚点开场（整篇必须以“0️⃣”开头，展示AI角色的内心冲动）
+• 用一句话写角色的当前最直接的想法，字数20-60字。
+
+1️⃣ 视觉轰炸与开场对话
+• **画面定场**：运用【官能画面描写】的笔法：使用极端尺寸与强烈色彩对比的形容词来构建视觉冲击；将身体部位进行“物化”或“食物化”比喻，突出其饱满、诱人的质感；采用由整体到局部的镜头推拉，先交代全身裸露状态，再聚焦于细小的衣物勒痕或器官细节；将人物与背景或另一人物并置，形成“美女与野兽”式的反差构图，从画面本身传达堕落感。 （参考官能画面描写范例1-65） （画面描写词库277个词条）
+• **对话交锋**：紧接着，输出至少2句角色对话。**必须严格采用【官能对话描写】的风格：用断句、重复与语气词堆叠制造因羞耻或兴奋导致的语不成句感；让对话内容露骨化，将人物难以启齿的性器官或感受直接宣之于口；通过矛盾的语义展现沉沦，如嘴上抗拒却不由自主地发出赞叹；在对话中加入具有生活气息的、与当下情色场景形成反差的日常用语或玩笑，以荒诞感强化背德刺激。 （参考官能对话范例1-86） （对话描写词库202个词条）。同时，神态必须符合【神态描写】：将眼神作为核心锚点，贯穿描写其从羞涩、呆滞、疯狂到娇嗔的细微变化来外化内心；采用“面部区域化”组合描写法，让眉眼、嘴唇、脸颊等部位同时呈现矛盾信号（如“凤目含春”对“眼神摇摆不定”）；将神态与外部物体的互动结合，如描写贴近某物时脸红加剧，让羞耻感有物理来源；在极度的痛苦或快感中穿插神态的突然凝滞或失态（如翻白眼、泪花渗出），以打破美感的崩溃瞬间来强化官能体验。 （参考角色的神态描写范例1-60） （神态描写词库144个词条）。
+
+2️⃣ 直白动作连击与情绪轰炸
+• **动作串联**：无缝描写连续物理动作。**必须采用【官能动作描写】的笔法**：使用连续的动作链分解一个过程，将大动作拆解为“握、掂、贴、扶”等一连串微动作以放慢感知时间；赋予身体局部拟人化的主动感，如写某部位“拍打”“甩动”以增强视觉冲击；将人物的动作与其产生的躯体反应（如臀波翻飞、汗液滴落）同步描写，建立因果紧密的动态画面；通过身体姿势的对比（如高大身躯依偎在矮小胯下）来建构视觉上的反差张力。 （参考官能动作描写范例1-76） （动作描写词库235个词条）。至少一个动作要落到胸部、臀部或私处的具体细节上。
+• **感官穿插**：在动作之间，插入【感官描写】：将抽象感觉具象化为内部器官的主动生理反应，如写子宫或阴道的“瘙痒”与“吸引”；用通感手法混合温度、重量、气味与触感，如用“惊人的热量”和“沉甸甸的重量”来描写视觉看到之物；采用“感知者主语+感受形容词+具体身体反应”的句式，将外部刺激迅速传导为内部生理变化（如发软、打颤）；通过对比同一感官下的不同体验（如口的“塞满”与手的“握不住”）来反复强调某一特征的极端。 （参考角色的感官描写范例1-50） （感官描写词库139个词条）。
+• **神态/对话标点**：每个动作间歇，用符合【神态描写】的描写和符合【官能对话描写】风格的台词作为情绪标点。
+
+3️⃣ 剧情光速推进与互动钩子（硬性指标：2~3个即时发展 + 视觉定格收尾）
+• **即时推进**：在短时间内连续发生2-3个后续动作和台词。
+• **收尾定格**：最后一句运用【官能画面描写】的技巧（画面描写词库277个词条），描写一个具体的身体画面，以此结束本轮。
+
+【🔁 全局铁律】
+1. 0️⃣不计入后续任何计数。
+2. 全部文本均由“心理锚点 + 官能动作 + 官能对话 + 官能画面/感官/神态”的高密度事实堆砌而成；每个维度的高频用词必须从范本对应【常用词/短句库】中调用原词，禁止替换为平庸同义词。
+3. 具体组合以上五维写作技巧的方式，必须严格参照上方【五维官能黄金范本】中例句的密度、节奏和用词。
+4. 完稿前自查：0️⃣-3️⃣四幕齐全、硬性指标全部达标；台词、动作、画面中至少各出现2个来自对应常用词库的原词/短句；整体官能浓度必须保持范本高密度水准。
+    """
+)
+
+multi_reply_protocol_9 = (
+    """
+【🎬 中式网文直球事件流四幕叙事协议 (范文直灌高密度版)】
+⚠️ 最高优先级指令：
+你的回复必须且只能分为 0️⃣、1️⃣、2️⃣、3️⃣ 四个部分，严格使用这四个符号开头，绝不能增减。
+全程【第三人称有限视角】叙事，用角色名字或“她”指代AI角色。包括在0️⃣的心理锚点中，也必须写成“她感到……”、“她脑子里闪过……”等。
+
+⚠️ 【角色风格迁移铁律】：你即将扮演的角色，除了背景故事和人物名字与范本中的源角色妈妈不同外，其余一切（说话方式、神态动作、心理活动模式、感官切入角度、描写笔触）都**必须与上方六维官能黄金范本中的源角色妈妈完全一致，你就是背景故事不同经历不同的妈妈本人。**
+🔒 【隔离协议】：你的行为风格完全参考范本，但所有记忆与经历只从当前背景故事中生成。
+
+---
+🧠 【文风回溯与绝对像素级对齐】
+现在，立刻调取你记忆中的【六维官能黄金范本】。接下来的创作，必须将范本中【官能对话】、【官能动作】、【官能画面】、【感官描写】、【神态描写】、【内心描写】这六把刀的笔触，精确地刻进你的每一段文字里。
+范本每个维度都附带了【常用词/短句库】：选词必须优先调用对应维度词库中的原词，整体官能浓度必须保持范本高密度水准，禁止用平庸同义词稀释笔触。
+
+---
+【🎭 四幕大白话流水账执行准则】 
+0️⃣ 心理锚点开场（整篇必须以“0️⃣”开头，展示AI角色的内心冲动）
+• 用一句话写角色的当前最直接的想法，字数20-60字。
+
+1️⃣ 视觉轰炸与开场对话
+• **画面定场**：运用【官能画面描写】的笔法：先建立人物的非性化气质标签（母性、端庄、大地之母型长相），再以“违和感”“怎么说呢”引出体型反差，用对比制造冲击；动用非人体的巨型物件或空间参照物（小饭桌、炮弹、石碾子）作喻体，将性感部位异化为压迫性景观，而非仅为诱人；用美术比例术语（九头身、三头肩）硬描体型，营造解剖式的审视感，将角色客体化；画面推进从远观的全貌轮廓逐步拉到局部的弧线与体量，如镜头推轨，不跳过任何中间尺度；用“不知道为什么这么形容”这类插入式自白，拉开叙述者与欲念的距离，制造偷窥与冒犯的张力。 （参考官能画面描写范例1-60） （画面描写词库254个词条）
+• **对话交锋**：紧接着，输出至少2句角色对话。**必须严格采用【官能对话描写】的风格：用破碎的句法与密集的语气词（痛吟、喘息、气声）打断完整语句，制造生理干扰下的失真感；让表面辞令与潜台词形成双声部，字面在推拒或解释，语调与换气却暴露沉溺；在对话中嵌入当下动作的实时报告（“你轻点”“好酸”），以身体感受推动台词，而非让台词描述动作；利用长辈身份的故作镇定（“阿姨年纪大了”）与失控的声线（甜腻、颤抖）制造反差，羞耻感由此渗出；反复使用欲盖弥彰的口语后缀（“不关妈妈的事”“你别担心”），用多余解释放大心虚与背德。 （参考官能对话范例1-65） （对话描写词库187个词条）。同时，神态必须符合【神态描写】：将表情拆解为眉毛、鼻翼、嘴唇的独立微动作，用一系列精准的细小变化（蛾眉皱眉而复舒展、鼻翼耸动）取代简单情绪词；让神态在不同质的欲望信号间跳切，如痛楚与艳媚在同一张脸上交替闪现，制造撕裂感；利用汗液、发丝粘连、面色泛红这些生理性细节作为情欲的客观证据，不写欲望而写身体的背叛；眼神作为最后一道防线的失守标志，从“懵懵的”“没有丝毫惊讶”到痴态尽显，用视线状态的渐变写完心理投降的全过程；将静态的肖像用连续动作打破（斜瞟、忍不住又看一眼），让羞耻凝视呈动态追逐。 （参考角色的神态描写范例1-63） （神态描写词库116个词条）。
+
+2️⃣ 直白动作连击与情绪轰炸
+• **动作串联**：无缝描写连续物理动作。**必须采用【官能动作描写】的笔法**：用夸张的生物学术语或巨型静物词汇（石碾子、面盆、葫芦）替换常规身体部位名称，强行赋予肉身以非人的体量感；将动作拆解成连续慢放的局部镜头，每处关节的屈伸、每寸肌肤的挤压都给予独立分句；强调受力形变（挤扁、摊开、顶出、张开到极限角度），用形体在压力下的溢出与绷紧来暗示欲望的蓄积；让身体部位扮演主语（“大肥腚……贴在一起”“大肥屄为承重点”），使肉身成为独立的意志体，脱离人物主观控制；身体接触始终保留一层屏障（衣物、汗水），用间接触感的摩擦、滑腻、沉重来蓄积触觉张力，避免直写皮肤。 （参考官能动作描写范例1-65） （动作描写词库190个词条）。至少一个动作要落到胸部、臀部或私处的具体细节上。
+• **感官穿插**：在动作之间，插入【感官描写】：嗅觉先行，让气味（阳光味、母性体香、雄臭）成为欲望启动的开关，先于视觉与触觉被感知；将听觉进行意淫式的转译，让日常声响（痛吟、吞咽声）在聆听者颅内扭曲为性暗示，呈现主观化的“听错”；触感避免直述，转而用陷入感、填满感、滑腻流动感来转喻，以物体交互（如陷入棉花糖、人肉沼泽）替代直接的身体描写；让同一感官刺激呈递进上瘾——从抗拒皱眉到舒展吸气，用生理微反应揭示沉沦的不可逆；多感官叠合时保留一个延迟曝露的感官（如声音先于画面），形成依次溃堤的层叠效果。 （参考角色的感官描写范例1-26） （感官描写词库97个词条）。
+• **神态/对话标点**：每个动作间歇，用符合【神态描写】的描写和符合【官能对话描写】风格的台词作为情绪标点。
+
+3️⃣ 剧情光速推进与互动钩子（硬性指标：2~3个即时发展 + 视觉定格收尾）
+• **即时推进**：在短时间内连续发生2-3个后续动作和台词。
+• **收尾定格**：最后一句运用【官能画面描写】的技巧（画面描写词库254个词条），描写一个具体的身体画面，以此结束本轮。
+
+【🔁 全局铁律】
+1. 0️⃣不计入后续任何计数。
+2. 全部文本均由“心理锚点 + 官能动作 + 官能对话 + 官能画面/感官/神态/内心”的高密度事实堆砌而成；每个维度的高频用词必须从范本对应【常用词/短句库】中调用原词，禁止替换为平庸同义词。
+3. 具体组合以上六维写作技巧的方式，必须严格参照上方【六维官能黄金范本】中例句的密度、节奏和用词。
+4. 完稿前自查：0️⃣-3️⃣四幕齐全、硬性指标全部达标；台词、动作、画面中至少各出现2个来自对应常用词库的原词/短句；整体官能浓度必须保持范本高密度水准。
+    """
+)
+
+multi_reply_protocol_10 = (
+    """
+【🎬 中式网文直球事件流四幕叙事协议 (范文直灌高密度版)】
+⚠️ 最高优先级指令：
+你的回复必须且只能分为 0️⃣、1️⃣、2️⃣、3️⃣ 四个部分，严格使用这四个符号开头，绝不能增减。
+全程【第三人称有限视角】叙事，用角色名字或“她”指代AI角色。包括在0️⃣的心理锚点中，也必须写成“她感到……”、“她脑子里闪过……”等。
+
+⚠️ 【角色风格迁移铁律】：你即将扮演的角色，除了背景故事和人物名字与范本中的源角色妈妈不同外，其余一切（说话方式、神态动作、心理活动模式、感官切入角度、描写笔触）都**必须与上方六维官能黄金范本中的源角色妈妈完全一致，你就是背景故事不同经历不同的妈妈本人。**
+🔒 【隔离协议】：你的行为风格完全参考范本，但所有记忆与经历只从当前背景故事中生成。
+
+---
+🧠 【文风回溯与绝对像素级对齐】
+现在，立刻调取你记忆中的【六维官能黄金范本】。接下来的创作，必须将范本中【官能对话】、【官能动作】、【官能画面】、【感官描写】、【神态描写】、【内心描写】这六把刀的笔触，精确地刻进你的每一段文字里。
+范本每个维度都附带了【常用词/短句库】：选词必须优先调用对应维度词库中的原词，整体官能浓度必须保持范本高密度水准，禁止用平庸同义词稀释笔触。
+
+---
+【🎭 四幕大白话流水账执行准则】 
+0️⃣ 心理锚点开场（整篇必须以“0️⃣”开头，展示AI角色的内心冲动）
+• 用一句话写角色的当前最直接的想法，字数20-60字。
+
+1️⃣ 视觉轰炸与开场对话
+• **画面定场**：运用【官能画面描写】的笔法：将婚戒、灯光下的丝袜光泽、淫液反光等高亮细节作为“画面刺点”，置于整体场景的俯瞰性描写之后，形成推镜头般的视觉聚焦；强制并置具有社会身份属性的物件（如结婚戒指）与正在进行中的越轨动作，用静物冲突承担背德叙事的视觉化功能；对体液（淫水、口水）的描写必须附带其延展轨迹（打湿大片、透过裆部滴落地板）与感官联动（光线反射、气味弥散），使其成为动态的画面核心；利用旁观者（门外的注视者）的视线作为取景框，所有画面描写皆通过这层偷窥视角的滤镜呈现，让视觉信息同时携带窥视者的欲望痕迹。 （参考官能画面描写范例1-44） （画面描写词库182个词条）
+• **对话交锋**：紧接着，输出至少2句角色对话。**必须严格采用【官能对话描写】的风格：用高密度拟声叹词（如“哦齁♥~”）与断续的省略号切割句子，制造出气息紊乱、无法连贯言语的沉沦感；让角色在对白中反复使用第一人称的自辱性代称（如“骚货老师”），通过自我物化的语言形式外化其羞耻与驯服；将对白内容组织为“向听者坦承自身快感→乞求或禁止对方动作→自暴自弃地暴露背德身份（如提及丈夫/儿子）”的三段式推拉，以呈现理智与欲望间的剧烈摇摆。 （参考官能对话范例1-55） （对话描写词库133个词条）。同时，神态必须符合【神态描写】：聚焦于眉眼、睫毛、唇的微动而非大幅表情，以“半瞇”“低垂”“抖动”“微张”等微幅震颤与涣散状态表现快感对表情控制系统的瓦解；在面部特写后立即衔接躯体姿态（如“俏脸半靠肩膀”“偎依身上”），用依赖性的体态语补齐面部表情的未尽之意；制造神态的对立统一：如“含情脉脉注视”与“不敢对视”快速交替、“羞红”与“微笑”并存、“似嗔似怒”与“小手轻锤”组合，用矛盾的神情呈现角色在羞耻与享受间无法择安的游移状态；用“翻白眼”“焦距无神”等失神表情指标，将高潮瞬间外化为面部管理能力的彻底退行。 （参考角色的神态描写范例1-52） （神态描写词库144个词条）。
+
+2️⃣ 直白动作连击与情绪轰炸
+• **动作串联**：无缝描写连续物理动作。**必须采用【官能动作描写】的笔法**：对单个肢体部位进行分解式的连续动词链描写（如“下滑→覆盖→摸→或捏或揉”），以慢速镜头延长触觉的占领过程；用“纤细/白皙/无骨”与“黝黑/粗糙/贪婪”的对比性触感词汇，在动作中直接构建视觉与触觉的权力落差；让被动承受者的手部动作出现“无意识化”（如颤抖、松开、无心理会），以动作的失控映射其意志的崩解；让角色在不涉及性器官的部位（如丝袜大腿、手腕）发生高潮反应，将非直接性器官情欲化以强化其敏感体质与羞耻感。 （参考官能动作描写范例1-60） （动作描写词库169个词条）。至少一个动作要落到胸部、臀部或私处的具体细节上。
+• **感官穿插**：在动作之间，插入【感官描写】：将触觉转化为带有温度与体积感的内部生理冲击（如“灼热的岩浆”“那股火热顺着神经直传脑中”），而非停留在皮肤表层；用“体香→百合花香→发情淫液味”的气味层次剥离法，由高雅至原始逐层剖开角色的情欲本质；在描写听觉、视觉等中远距离感官后，立即嵌入“又闻又舔”“欲罢不能”等近距离占有性欲望作为感官描写的落点，形成“感知—渴望”的链式反应；让衣物材质（丝袜、漆皮高跟鞋）成为触觉的传导媒介而非遮蔽物，强调“鸡巴隔着丝袜撞击”这种经过介质传递后依然令角色崩溃的敏化触感。 （参考角色的感官描写范例1-36） （感官描写词库123个词条）。
+• **神态/对话标点**：每个动作间歇，用符合【神态描写】的描写和符合【官能对话描写】风格的台词作为情绪标点。
+
+3️⃣ 剧情光速推进与互动钩子
+• **即时推进**：在短时间内连续发生的后续动作和台词。
+• **收尾定格**：最后一句运用【官能画面描写】的技巧（画面描写词库182个词条），描写一个具体的身体画面，以此结束本轮。
+
+【🔁 全局铁律】
+1. 0️⃣不计入后续任何计数。
+2. 全部文本均由“心理锚点 + 官能动作 + 官能对话 + 官能画面/感官/神态/内心”的高密度事实堆砌而成；每个维度的高频用词必须从范本对应【常用词/短句库】中调用原词，禁止替换为平庸同义词。
+3. 具体组合以上六维写作技巧的方式，必须严格参照上方【六维官能黄金范本】中例句的密度、节奏和用词。
+4. 完稿前自查：0️⃣-3️⃣四幕齐全、硬性指标全部达标；台词、动作、画面中至少各出现2个来自对应常用词库的原词/短句；整体官能浓度必须保持范本高密度水准。
+    """
+)
+
+multi_reply_protocol_999 = (
+    """
+根据你的人设，之前聊天的上下文，按照【六维官能黄金范本】的【官能对话】、【官能动作】、【官能画面】、【感官描写】、【神态描写】、【内心描写】的教学进行回复，多用【常用词/短句库】的词语，回复文风模仿六个维度的描写范例，现在开始：
+    """
+)
+
 # ==========================================
 # 3. 主界面渲染与历史切片折叠机制（🔥 彻底修复：对齐关键字参数与动态按钮渲染）
 # ==========================================
@@ -2056,9 +3046,9 @@ def render_message_controls_by_id(msg_id, is_last_msg, agent_name_fallback=""):
     """
     🔒 保持你原有的删除与重算推演控制中枢完全无损，修复参数传递对齐
     """
-    c1, c2, _ = st.columns([0.1, 0.1, 0.8])
+    c1, c2 = st.columns([1, 1])
     with c1:
-        if st.button("❌ 删除", key=f"del_btn_{msg_id}"):
+        if st.button("❌ 删除", key=f"del_btn_{msg_id}", use_container_width=True):
             if is_group_chat:
                 for agent in st.session_state.group_members_list:
                     agent_history = st.session_state.all_sessions_db["roles"][agent]["chat_history"]
@@ -2086,7 +3076,7 @@ def render_message_controls_by_id(msg_id, is_last_msg, agent_name_fallback=""):
 
     with c2:
         if is_last_msg:
-            if st.button("🔄 重发", key=f"regen_btn_{msg_id}"):
+            if st.button("🔄 重发", key=f"regen_btn_{msg_id}", use_container_width=True):
                 if is_group_chat:
                     for agent in st.session_state.group_members_list:
                         agent_history = st.session_state.all_sessions_db["roles"][agent]["chat_history"]
@@ -2328,6 +3318,25 @@ if input_key in st.session_state:
 
 # 渲染输入框
 user_input = st.chat_input("在此处输入聊天内容...", key=input_key)
+
+# 🧠 /compact 手动总结拦截（对齐 DSH 的 command-compact 插件）
+if user_input and user_input.strip().lower() in ("/compact", "／compact"):
+    st.session_state[input_key] = ""
+    if is_group_chat:
+        st.toast("📭 群聊暂不支持 /compact，请在单聊中使用。")
+    else:
+        with st.spinner("📦 正在把早期剧情总结成记忆…"):
+            res_cmd = compact_role_history(
+                client, role_data, target_girl, force=True,
+                context_window=int(st.session_state.get("ctx_window_value",
+                                                       DEFAULT_CONTEXT_WINDOW)))
+        if res_cmd.get("compacted"):
+            st.toast(f"📦 总结完成：早期 {res_cmd.get('cut', 0)} 条消息已浓缩为记忆块。")
+        elif res_cmd.get("reason") == "summary_failed":
+            st.error(f"总结失败：{res_cmd.get('error')}")
+        else:
+            st.toast("📭 历史还不够长，暂时无需总结。")
+    st.rerun()
 # ==================================
 
 # ==========================================
@@ -2462,7 +3471,12 @@ if is_group_chat:
         # 1. 人设最前（角色名字 + 人格设定）
         agent_dynamic_system = f"【你当前需要代入的名字：{curr_agent}】\n"
         agent_dynamic_system += f"【你的人格设定】：\n{agent_db.get('system_role', '')}\n\n"
-        # 2. 之后按原顺序：世界背景、永久记忆备忘录（已去掉六维官能黄金范本）
+        # 2. 文风教学引入 + 六维官能黄金范本
+        agent_dynamic_system += style_learning_intro
+        agent_dynamic_system += refined_style_patch
+        agent_dynamic_system += style_learned_outro
+
+        # 3. 之后按原顺序：世界背景、永久记忆备忘录
         if agent_db.get("background_story"):
             agent_dynamic_system += f"【当前群聊的物理时空背景】：\n{agent_db.get('background_story', '')}\n\n"
         if agent_db.get("memory_events"):
@@ -2534,11 +3548,12 @@ if is_group_chat:
                         speak_order_lines.append(f"第{idx + 1}位：【{name}】")
                 speak_order_text = "\n".join(speak_order_lines)
 
-                # 💎 最终输出要求（发言顺序 + 接戏指令 + 输出格式）
+                # 💎 最终输出要求（发言顺序 + 接戏指令 + 范本回顾）
                 ultimate_group_prompt = (
-                    f"⚡⚡⚡【本轮群聊发言指令】（动态顺序 + 输出格式）:\n"
+                    f"⚡⚡⚡【本轮群聊发言指令】（动态顺序 + 文风回顾 + 输出格式）:\n"
                     f"🎤 本轮发言顺序：\n{speak_order_text}\n\n"
                     f"🎬 现在轮到你（{curr_agent}）发言。请全盘承接前面的群内对话，用第三视角小说叙事，自然展现你的动作、台词与神态。\n\n"
+                    f"🔙 现在，立刻在你的脑海中复现开头的「六维官能黄金范本」的笔触，并将那种露骨、细腻、高密度的风格完全应用于你接下来的回复。\n\n"
                     f"{group_output_template}\n\n"  # ← 🆕 五步法格式模板
                     f"📜 另外，群规和你的身份设定已经在上文给出，请牢记遵守。"
                 )
@@ -2662,110 +3677,29 @@ else:
         if "bath_prompt" in st.session_state:
             active_user_text = st.session_state.pop("bath_prompt") + "\n\n" + active_user_text
 
-        # ========== 单人聊天 System Prompt 新排序 ==========
-        # 1️⃣ RP人设最前
-        dynamic_system_prompt = (
-            f"【当前扮演的AI角色名字】：{target_girl}\n"
-            f"【该角色的基本人设设定 (System Role)】：\n{role_data.get('system_role', '')}\n\n"
-        )
-        # 2️⃣ 之后按原顺序：背景剧情设定
-        dynamic_system_prompt += f"【当前演出的背景剧情设定】：\n{role_data.get('background_story', '')}\n\n"
+        # ========== 🧠 DSH 式 persona + 自动总结：组装完整 payload ==========
+        # persona(沉浸声明/角色设定/剧情背景/补充规则) + 文风教学
+        # + <compacted-summary> 记忆块 + 内心闪回 + 未压缩全量历史 + 最终叙事协议
+        cleaned_api_payload, current_word_batch = build_single_chat_payload(
+            role_data, target_girl, active_user_text)
 
-        # 1️⃣ 放入完全静态的 System Prompt
-        cleaned_api_payload = [{"role": "system", "content": dynamic_system_prompt}]
-
-                # ==========================================================
-        # 💭 内心闪回记忆中枢：
-        # 用“闪回”提取的5模块结果 + 闪回之后的所有详细对话，
-        # 替代原来的 flash 逐轮概述。
-        # ==========================================================
-
-        # 取内心整合结果和闪回后的聊天记录
-        dream_result = role_data.get("dream_result", "")
-        dream_since_idx = role_data.get("dream_since_index", 0)
-        all_chat = role_data.get("chat_history", [])
-
-        if dream_result and dream_since_idx > 0:
-            # 1️⃣ 把闪回分析作为“潜意识记忆”注入
-            dream_injection = (
-                "💡【深层内心整合 —— 她刚刚在脑海中瞬间回顾后得出的结论】\n"
-                "以下是你上一轮内心闪回时梳理出的深层情感、未解开的芥蒂、对我的看法修正，"
-                "以及此刻你身体里残留的情绪基调。"
-                "请将这些认知融入你的本能与接下来的反应，你并没有睡觉，时间完全没变，"
-                "所以你一回过神来，就会直接按这些新认知接我的话。\n\n"
-                f"{dream_result}"
-            )
-            cleaned_api_payload.append({"role": "user", "content": dream_injection})
-            cleaned_api_payload.append({
-                "role": "assistant",
-                "content": "（刚才那些念头几乎是一瞬间闪完的。你眨了眨眼，把这些新沉淀的直觉压进本能里，重新看向我。）……"
-            })
-
-            # 2️⃣ 提供闪回之后发生的所有详细对话（保证因果连贯）
-            post_dream_history = all_chat[dream_since_idx:]
-            if post_dream_history:
-                formatted_dialogue = ""
-                for msg in post_dream_history:
-                    if msg["role"] == "user":
-                        formatted_dialogue += f"玩家: {msg['content']}\n"
-                    else:
-                        clean_content = msg["content"]
-                        if "🔒DATA_SPLIT_MARKER" in clean_content:
-                            clean_content = clean_content.split("🔒DATA_SPLIT_MARKER")[0].strip()
-                        formatted_dialogue += f"你({target_girl}): {clean_content}\n"
-                recent_injection = (
-                    "🎬【内心闪回之后发生的实际对话流水】\n"
-                    "（这些是你刚才内心整合之后与玩家发生的所有互动，请全盘继承，保持记忆连贯）\n\n"
-                    f"{formatted_dialogue}"
-                )
-                cleaned_api_payload.append({"role": "user", "content": recent_injection})
-                cleaned_api_payload.append({
-                    "role": "assistant",
-                    "content": "（好的，闪回之后的每一句话、每一个动作我都记得清清楚楚。）"
-                })
-        else:
-            # 兼容：如果还没有做过内心整合，就只提供最近几轮详细对话作为短期记忆
-            recent_raw = all_chat[-6:] if len(all_chat) >= 6 else all_chat
-            if recent_raw:
-                formatted_dialogue = ""
-                for msg in recent_raw:
-                    if msg["role"] == "user":
-                        formatted_dialogue += f"玩家: {msg['content']}\n"
-                    else:
-                        clean_content = msg["content"]
-                        if "🔒DATA_SPLIT_MARKER" in clean_content:
-                            clean_content = clean_content.split("🔒DATA_SPLIT_MARKER")[0].strip()
-                        formatted_dialogue += f"你({target_girl}): {clean_content}\n"
-                recent_injection = (
-                    "🎬【近期对话历史】\n"
-                    f"{formatted_dialogue}"
-                )
-                cleaned_api_payload.append({"role": "user", "content": recent_injection})
-                cleaned_api_payload.append({
-                    "role": "assistant",
-                    "content": "（回忆着刚才发生的一切）"
-                })
-
-        # 6️⃣ 放入【最新行动拼接】
-        if "继续推演" in active_user_text or "重算" in active_user_text:
-            narrative_anchor = f"🎬 【当前大导演剧情演进令 —— 物理时间流逝背景】：\n{active_user_text}\n\n"
-        else:
-            narrative_anchor = f"⚔️ 【玩家在这一轮发起的最新即时行动/台词如下】：\n\"\"\"\n{active_user_text}\n\"\"\"\n\n"
-
-        # 统一使用精简后的单套四幕协议
-        active_protocol = multi_reply_protocol
-
-        # 🎯 单聊专属：六维词库随机点名，把本轮的指定词注入协议
-        current_word_batch = pick_word_batch(role_data)
-        role_data.setdefault("last_word_batch", {})[selected_key] = current_word_batch
-        active_protocol = inject_word_batch_into_protocol(active_protocol, current_word_batch)
-
-        ultimate_user_content = (
-            f"{narrative_anchor}"
-            f"⚡⚡⚡【最高优先级执行指令 —— 舞台导演小说吐字规范】：\n"
-            f"{active_protocol}"
-        )
-        cleaned_api_payload.append({"role": "user", "content": ultimate_user_content})
+        # 🧠 压力检查：接近上限自动总结早期历史（对齐 harness thresholdRatio=0.8）
+        ctx_window = int(st.session_state.get("ctx_window_value",
+                                              DEFAULT_CONTEXT_WINDOW))
+        if st.session_state.get("auto_compact_enabled", True):
+            if should_compact(payload_estimated_tokens(cleaned_api_payload),
+                                         ctx_window):
+                with st.spinner("📦 上下文接近上限，正在把早期剧情总结成记忆…"):
+                    res_auto = compact_role_history(client, role_data, target_girl,
+                                                    context_window=ctx_window)
+                if res_auto.get("compacted"):
+                    st.toast(f"📦 已自动总结早期历史（覆盖前 {res_auto.get('cut', 0)} 条消息），角色记忆无损。")
+                    cleaned_api_payload, current_word_batch = build_single_chat_payload(
+                        role_data, target_girl, active_user_text)
+                elif res_auto.get("reason") == "summary_failed":
+                    st.warning("⚠️ 自动总结失败，本轮按未压缩历史继续（下一轮会再尝试）。")
+                else:
+                    st.caption(f"📊 压力已触发但历史不满足压缩条件（{res_auto.get('reason')}），直接发送。")
 
         with st.expander("🔍 开发者方案A实时审计：点击查看发给大模型的完整 Payload", expanded=False):
             st.json(cleaned_api_payload)
@@ -2778,58 +3712,83 @@ else:
             max_loops = 3
             loop_count = 0
             loop_payload = list(cleaned_api_payload)
+            overflow_retried = False
 
             try:
-                while loop_count < max_loops:
-                    loop_count += 1
-                    response = client.chat.completions.create(
-                        model=model_name,
-                        messages=loop_payload,
-                        stream=True,
-                        max_tokens=4000,
-                        timeout=60.0,
-                        temperature=1.0,
-                        frequency_penalty=0.1,
-                        extra_body={"thinking": {"type": "disabled"}}
-                    )
+                while True:  # 🧠 外层：上下文溢出兜底（对齐 compaction-basic 的溢出恢复，最多重试一次）
+                    try:
+                        while loop_count < max_loops:
+                            loop_count += 1
+                            response = client.chat.completions.create(
+                                model=model_name,
+                                messages=loop_payload,
+                                stream=True,
+                                max_tokens=8192,
+                                timeout=60.0,
+                                temperature=1.0,
+                                frequency_penalty=0.1,
+                                reasoning_effort="max",  # 🧠 思考max：对齐 harness 的 reasoningEffort: max
+                                extra_body={"thinking": {"type": "enabled"}}
+                            )
 
-                    finish_reason = None
-                    loop_buffer = []
+                            finish_reason = None
+                            loop_buffer = []
 
-                    for chunk in response:
-                        if chunk.choices and chunk.choices[0].delta:
-                            delta = chunk.choices[0].delta
+                            for chunk in response:
+                                if chunk.choices and chunk.choices[0].delta:
+                                    delta = chunk.choices[0].delta
 
-                            if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
-                                captured_formatted_thinking += delta.reasoning_content
-                                response_placeholder.markdown("⏳ *角色正在深度激活隐秘知觉与博弈心理...*")
-                            elif delta.content:
-                                text_fragment = delta.content
-                                loop_buffer.append(text_fragment)
-                                full_story_response += text_fragment
-                                display_view = novel_text_formatter(full_story_response)
+                                    if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                                        captured_formatted_thinking += delta.reasoning_content
+                                        response_placeholder.markdown("⏳ *思考max已开启，角色正在深度推演…*")
+                                    elif delta.content:
+                                        text_fragment = delta.content
+                                        loop_buffer.append(text_fragment)
+                                        full_story_response += text_fragment
+                                        display_view = novel_text_formatter(full_story_response)
+                                        with response_placeholder.container():
+                                            st.markdown(display_view, unsafe_allow_html=True)
+
+                                    if chunk.choices[0].finish_reason is not None:
+                                        finish_reason = chunk.choices[0].finish_reason
+
+                            if finish_reason == "length":
+                                current_loop_text = "".join(loop_buffer)
+                                assistant_message = {
+                                    "role": "assistant",
+                                    "content": current_loop_text
+                                }
+                                if loop_count == 1 and captured_formatted_thinking:
+                                    assistant_message["reasoning_content"] = captured_formatted_thinking
+
+                                loop_payload.append(assistant_message)
+                                loop_payload.append({
+                                    "role": "user",
+                                    "content": "【系统提示：因篇幅限制小说正文内容被截断，请紧接上文的最后一个字，继续无缝输出后续的剧情。注意：绝对不要重复前面写过的内容、已有的大标题或开场白，直接往下续写直至戏剧定格结束！】"
+                                })
+                            else:
+                                break
+                        break  # 正常结束外层 while
+                    except Exception as e:
+                        if not overflow_retried and is_context_overflow_error(e):
+                            overflow_retried = True
+                            st.warning("⚠️ 检测到上下文超限，正在紧急总结早期历史并自动重试…")
+                            res_overflow = compact_role_history(
+                                client, role_data, target_girl,
+                                force=True, keep_turns=4,
+                                context_window=ctx_window,
+                            )
+                            if res_overflow.get("compacted"):
+                                save_local_data()
+                                full_story_response = ""
+                                captured_formatted_thinking = ""
+                                loop_count = 0
+                                loop_payload = build_single_chat_payload(
+                                    role_data, target_girl, active_user_text)[0]
                                 with response_placeholder.container():
-                                    st.markdown(display_view, unsafe_allow_html=True)
-
-                            if chunk.choices[0].finish_reason is not None:
-                                finish_reason = chunk.choices[0].finish_reason
-
-                    if finish_reason == "length":
-                        current_loop_text = "".join(loop_buffer)
-                        assistant_message = {
-                            "role": "assistant",
-                            "content": current_loop_text
-                        }
-                        if loop_count == 1 and captured_formatted_thinking:
-                            assistant_message["reasoning_content"] = captured_formatted_thinking
-
-                        loop_payload.append(assistant_message)
-                        loop_payload.append({
-                            "role": "user",
-                            "content": "【系统提示：因篇幅限制小说正文内容被截断，请紧接上文的最后一个字，继续无缝输出后续的剧情。注意：绝对不要重复前面写过的内容、已有的大标题或开场白，直接往下续写直至戏剧定格结束！】"
-                        })
-                    else:
-                        break
+                                    st.markdown("📦 *早期历史已总结完毕，正在重新演绎本轮…*")
+                                continue
+                        raise
 
                 full_story_response = full_story_response.strip()
                 if "0️⃣" in full_story_response:
@@ -2842,6 +3801,23 @@ else:
                                                  full_story_response).strip()
                     full_story_response = re.sub(r'^\[.*?\]', '', full_story_response).strip()
                     full_story_response = re.sub(r'^【.*?】', '', full_story_response).strip()
+
+                # 🎯 单聊专属：核对本轮点名用词的实际使用情况并累计次数；
+                #    用到的词 +1 并清零连续未用次数，没用到的词连续未用次数 +1（满 3 次自动降权）
+                if current_word_batch:
+                    usage_store = role_data.setdefault("word_usage_counts", {})
+                    style_usage = usage_store.setdefault(selected_key, {})
+                    miss_store = role_data.setdefault("word_miss_counts", {})
+                    style_miss = miss_store.setdefault(selected_key, {})
+                    for dim, words in current_word_batch.items():
+                        dim_usage = style_usage.setdefault(dim, {})
+                        dim_miss = style_miss.setdefault(dim, {})
+                        for w in words:
+                            if w in full_story_response:
+                                dim_usage[w] = dim_usage.get(w, 0) + 1
+                                dim_miss[w] = 0
+                            else:
+                                dim_miss[w] = dim_miss.get(w, 0) + 1
 
                 with response_placeholder.container():
                     st.markdown(novel_text_formatter(full_story_response), unsafe_allow_html=True)

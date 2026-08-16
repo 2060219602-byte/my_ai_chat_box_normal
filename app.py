@@ -1964,10 +1964,14 @@ def build_single_chat_payload(role_data, target_girl, active_user_text):
     role_data.setdefault("last_word_batch", {})[selected_key] = current_word_batch
     active_protocol = inject_word_batch_into_protocol(active_protocol, current_word_batch)
 
+    # 🔥 prompt 末尾追加六维热词速查（每个维度15个；0️⃣ 锚点自动对应心理/感官维度）
+    hot_words_block = build_hot_words_block(current_word_batch, active_protocol)
+
     ultimate_user_content = (
         f"{narrative_anchor}"
         f"⚡⚡⚡【最高优先级执行指令 —— 舞台导演小说吐字规范】：\n"
-        f"{active_protocol}"
+        f"{active_protocol}\n"
+        f"{hot_words_block}"
     )
     payload.append({"role": "user", "content": ultimate_user_content})
     return payload, current_word_batch
@@ -2688,6 +2692,48 @@ def inject_word_batch_into_protocol(protocol_text, batch):
             if tail.endswith(("。", "；", "，")):
                 tail = tail[:-1]
             lines[line_idx] = tail + f"。本轮参考{label}用词（按场景合理使用，不强行凑词）：{word_text}"
+    return "\n".join(lines)
+
+
+def detect_zero_anchor_type(protocol_text):
+    """判断协议中 0️⃣ 模块是心理锚点还是感官锚点"""
+    zero_section = ""
+    idx = protocol_text.find("0️⃣")
+    if idx >= 0:
+        end_candidates = [i for i in (protocol_text.find("1️⃣", idx), protocol_text.find("\n1️⃣", idx)) if i >= 0]
+        end_idx = min(end_candidates) if end_candidates else len(protocol_text)
+        zero_section = protocol_text[idx:end_idx]
+
+    sensory_keys = ["感官锚点", "感官冲击", "【感官描写】风格的句子打头"]
+    psych_keys = ["心理锚点", "内心冲动", "【内心描写】风格的句子打头",
+                  "用一句【心理】风格的句子", "当前最直接的想法"]
+
+    if any(k in zero_section for k in sensory_keys):
+        return "感官"
+    if any(k in zero_section for k in psych_keys):
+        return "心理"
+    # 兜底：多数旧协议默认心理锚点
+    return "心理"
+
+
+def build_hot_words_block(batch, protocol_text):
+    """在 prompt 末尾生成六维热词速查：每个维度 15 个；0️⃣ 锚点自动对应心理/感官维度"""
+    zero_type = detect_zero_anchor_type(protocol_text)
+    zero_desc = "心理/内心描写" if zero_type == "心理" else "感官/感官描写"
+    lines = [
+        "",
+        "🔥【本轮六维热词速查 —— 每个维度15个，优先原词入文，不强行凑词】：",
+        f"（当前协议 0️⃣ 锚点：{zero_desc}）",
+    ]
+    for dim in WORD_DIMENSIONS:
+        words = (batch.get(dim) or [])[:WORDS_PER_DIMENSION]
+        marker = ""
+        if zero_type == "感官" and dim == "感官描写":
+            marker = "（0️⃣锚点对应）"
+        elif zero_type == "心理" and dim == "内心描写":
+            marker = "（0️⃣锚点对应）"
+        word_str = "、".join(words) if words else "（暂无词库）"
+        lines.append(f"{dim}{marker}：{word_str}")
     return "\n".join(lines)
 
 

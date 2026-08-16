@@ -2416,7 +2416,7 @@ style_options = {
     "妈妈-高中毕业聚会那天，可千万不要带妈妈去！": "processed_7",
     "宋振萤-巫女屠龙记": "processed_8",
     "妈妈-我的熟母玉观音": "processed_9",
-    "冰儿/雪儿": "processed_10"
+    "冰儿雪儿": "processed_10"
 }
 
 # ✨【新增】首次启动时，从云端数据库加载上次保存的偏好，并注入到 st.session_state 中
